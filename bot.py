@@ -234,9 +234,23 @@ async def enforce_bans_for_guild(guild: discord.Guild, info_channel_id: int, spa
         return
     for uid in ids:
         try:
-            await guild.ban(discord.Object(id=uid), reason="Listed in commissionSpammer database", delete_message_seconds=0)
-            uname = await fetch_username_safe(uid)
-            await send_info(guild, info_channel_id, f"User {uname} was banned (on banlist).")
+            # Best-effort: only announce if the user appears to be in this guild now
+            # We intentionally avoid privileged member intent; cache-only check
+            was_member = guild.get_member(uid) is not None
+
+            await guild.ban(
+                discord.Object(id=uid),
+                reason="Listed in commissionSpammer database",
+                delete_message_seconds=0,
+            )
+
+            if was_member:
+                uname = await fetch_username_safe(uid)
+                await send_info(
+                    guild,
+                    info_channel_id,
+                    f"User {uname} was in the server and was removed and banned (on banlist).",
+                )
             await asyncio.sleep(1.0)  # rate-limit friendly
         except discord.Forbidden:
             await send_info(guild, info_channel_id, "I lack Ban Members permission. Please grant it.")
@@ -329,16 +343,30 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
 
+    # Acknowledge immediately to avoid 3s timeout ('Unknown interaction' 10062)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+    except Exception:
+        # If already acknowledged somehow, ignore
+        pass
+
     upsert_server(guild.id, guild.owner_id)
     set_enabler(guild.id, enabled)
 
     # If enabling and channel already set, kick off a one-time run and start loop
     info = get_server_info(guild.id)
+    note = ""
     if enabled and info and info.get("info_channel_id"):
         await enforce_bans_for_guild(guild, info["info_channel_id"])  # run once immediately
         start_loop_if_needed()
+    elif enabled and (not info or not info.get("info_channel_id")):
+        note = " Set the info channel with /banner set-channel to begin enforcement."
 
-    await interaction.response.send_message(f"Auto-banning is now {'enabled' if enabled else 'disabled'}.", ephemeral=True)
+    await interaction.followup.send(
+        f"Auto-banning is now {'enabled' if enabled else 'disabled'}.{note}",
+        ephemeral=True,
+    )
 
 
 @banner_group.command(name="status", description="Show current server settings.")
