@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 from typing import Optional, List, Tuple
 
 import discord
@@ -333,19 +334,40 @@ async def enforce_bans_once_global():
     targets = get_enabled_configured_servers()
     if not targets:
         return
+
     spammer_ids = get_spammer_ids()
     if not spammer_ids:
         return
-    log.info(f"Enforcing {len(spammer_ids)} spammer IDs across {len(targets)} enabled+configured servers.")
+
+    log.info(
+        f"Enforcing {len(spammer_ids)} spammer IDs across {len(targets)} enabled+configured servers."
+    )
+
+    # Process each guild sequentially, with a small random jitter between them
     for server_id, channel_id in targets:
         guild = bot.get_guild(server_id)
         if not guild:
             continue
-        await enforce_bans_for_guild(guild, channel_id, spammer_ids)
+
+        # Per-guild jitter: 0–3 seconds so large fleets don't all fire at once
+        jitter = random.uniform(0, 3)
+        await asyncio.sleep(jitter)
+
+        try:
+            new_count = await enforce_bans_for_guild(guild, channel_id, spammer_ids)
+            log.info(
+                f"Guild {guild.id}: enforcement complete, {new_count} new user(s) added to ban list."
+            )
+        except Exception as e:
+            log.exception(f"Error enforcing bans in guild {server_id}: {e}")
 
 
 @tasks.loop(hours=1)
 async def enforce_bans_loop():
+    # Add jitter of 0–300 seconds (0–5 minutes)
+    jitter_seconds = random.randint(0, 300)
+    log.info(f"Jitter delay before global ban enforcement: {jitter_seconds} seconds.")
+    await asyncio.sleep(jitter_seconds)
     await enforce_bans_once_global()
 
 
