@@ -133,6 +133,17 @@ def upsert_server(server_id: int, owner_id: int, info_channel_id: Optional[int] 
     finally:
         conn.close()
 
+def remove_spammer_id(discord_id: int):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.users WHERE discord_id = %s;",
+                    (discord_id,)
+                )
+    finally:
+        conn.close()
 
 def get_server_info(server_id: int) -> Optional[dict]:
     conn = get_db_connection()
@@ -226,24 +237,55 @@ async def send_info(guild: discord.Guild, channel_id: Optional[int], message: st
 
 
 # -------------------- Enforcement --------------------
-async def enforce_bans_for_guild(guild: discord.Guild, info_channel_id: int, spammer_ids: Optional[List[int]] = None):
+async def enforce_bans_for_guild(
+    guild: discord.Guild,
+    info_channel_id: int,
+    spammer_ids: Optional[List[int]] = None,
+) -> int:
+    """
+    Enforce bans for a single guild.
+    Returns the number of *new* users added to the guild's ban list.
+    """
     if not guild or not info_channel_id:
-        return
+        return 0
+
+    # All spammer IDs from DB (or override if provided)
     ids = set(spammer_ids or get_spammer_ids())
     if not ids:
-        return
-    for uid in ids:
+        log.debug(f"No spammer IDs found for guild {guild.id}. Nothing to ban.")
+        return 0
+
+    # Fetch current bans from Discord
+    already_banned_ids: set[int] = set()
+    try:
+        async for ban_entry in guild.bans(limit=None):
+            already_banned_ids.add(ban_entry.user.id)
+    except Exception as e:
+        log.debug(f"Failed to fetch ban list in guild {guild.id}: {e}")
+
+    # Only ban IDs that are NOT already banned
+    to_ban = ids - already_banned_ids
+    if not to_ban:
+        log.debug(f"No new bans needed for guild {guild.id}.")
+        return 0
+
+    new_ban_count = 0
+
+    for uid in to_ban:
         try:
-            # Best-effort: only announce if the user appears to be in this guild now
-            # We intentionally avoid privileged member intent; cache-only check
+            # Only detect membership from cache (no intents)
             was_member = guild.get_member(uid) is not None
 
+            # Attempt the ban
             await guild.ban(
                 discord.Object(id=uid),
                 reason="Listed in commissionSpammer database",
                 delete_message_seconds=0,
             )
 
+            new_ban_count += 1
+
+            # Notify if the user was actually in the server at ban time
             if was_member:
                 uname = await fetch_username_safe(uid)
                 await send_info(
@@ -251,22 +293,41 @@ async def enforce_bans_for_guild(guild: discord.Guild, info_channel_id: int, spa
                     info_channel_id,
                     f"User {uname} was in the server and was removed and banned (on banlist).",
                 )
-            await asyncio.sleep(1.0)  # rate-limit friendly
+
+            await asyncio.sleep(1.0)  # avoid rate limit issues
+
         except discord.Forbidden:
-            await send_info(guild, info_channel_id, "I lack Ban Members permission. Please grant it.")
-            log.warning(f"Forbidden banning {uid} in guild {guild.id}")
+            # Bot lacks ban permissions
+            await send_info(
+                guild,
+                info_channel_id,
+                "I lack the 'Ban Members' permission. Please adjust role permissions.",
+            )
+            log.warning(f"Forbidden from banning {uid} in guild {guild.id}")
             break
+
         except discord.HTTPException as e:
-            # 30035: Already banned
-            if getattr(e, "code", None) == 30035:
+            code = getattr(e, "code", None)
+
+            if code == 30035:
+                # Already banned (Discord duplication)
                 pass
+
+            elif code == 10013:
+                # Unknown User — account deleted or otherwise nonexistent
+                log.info(f"User {uid} no longer exists on Discord. Removing from database.")
+                remove_spammer_id(uid)
+
             else:
-                log.debug(f"HTTPException banning {uid} in guild {guild.id}: {e}")
+                log.debug(f"HTTP error banning {uid} in guild {guild.id}: {e}")
+
             await asyncio.sleep(0.2)
+    
         except Exception as e:
             log.debug(f"Unexpected error banning {uid} in guild {guild.id}: {e}")
             await asyncio.sleep(0.2)
 
+    return new_ban_count
 
 async def enforce_bans_once_global():
     targets = get_enabled_configured_servers()
@@ -283,7 +344,7 @@ async def enforce_bans_once_global():
         await enforce_bans_for_guild(guild, channel_id, spammer_ids)
 
 
-@tasks.loop(minutes=15)
+@tasks.loop(hours=1)
 async def enforce_bans_loop():
     await enforce_bans_once_global()
 
@@ -343,30 +404,44 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
 
-    # Acknowledge immediately to avoid 3s timeout ('Unknown interaction' 10062)
+    # Acknowledge quickly
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
     except Exception:
-        # If already acknowledged somehow, ignore
         pass
 
+    # Update DB (still blocking, but very fast in practice)
     upsert_server(guild.id, guild.owner_id)
     set_enabler(guild.id, enabled)
 
-    # If enabling and channel already set, kick off a one-time run and start loop
     info = get_server_info(guild.id)
     note = ""
+    run_now = False
     if enabled and info and info.get("info_channel_id"):
-        await enforce_bans_for_guild(guild, info["info_channel_id"])  # run once immediately
-        start_loop_if_needed()
+        run_now = True   # we'll run it in background
     elif enabled and (not info or not info.get("info_channel_id")):
         note = " Set the info channel with /banner set-channel to begin enforcement."
 
-    await interaction.followup.send(
-        f"Auto-banning is now {'enabled' if enabled else 'disabled'}.{note}",
-        ephemeral=True,
-    )
+    # Tell the user right away
+    try:
+        await interaction.followup.send(
+            f"Auto-banning is now {'enabled' if enabled else 'disabled'}.{note}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        log.warning(f"Failed to send enable reply in guild {guild.id}: {e}")
+
+    # Kick off ban enforcement in the background if needed
+    if run_now:
+        async def _run_enforcement():
+            try:
+                await enforce_bans_for_guild(guild, info["info_channel_id"])
+                start_loop_if_needed()
+            except Exception:
+                log.exception(f"Error running initial enforcement for guild {guild.id}")
+
+        asyncio.create_task(_run_enforcement())
 
 
 @banner_group.command(name="status", description="Show current server settings.")
@@ -394,13 +469,34 @@ async def sync_now_cmd(interaction: discord.Interaction):
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
+
     info = get_server_info(guild.id)
     if not info or not info.get("info_channel_id"):
-        await interaction.response.send_message("Info channel is not set yet. Use /banner set-channel first.", ephemeral=True)
+        await interaction.response.send_message(
+            "Info channel is not set yet. Use /banner set-channel first.",
+            ephemeral=True
+        )
         return
-    await interaction.response.send_message("Sync started. I will process the ban list shortly.", ephemeral=True)
-    await enforce_bans_for_guild(guild, info["info_channel_id"])  # run for this guild only
-    await interaction.followup.send("Sync complete.", ephemeral=True)
+
+    await interaction.response.send_message("Sync started...", ephemeral=True)
+
+    async def _run_sync():
+        try:
+            new_count = await enforce_bans_for_guild(guild, info["info_channel_id"])
+            await interaction.followup.send(
+                f"Sync complete. **{new_count} new user{'s' if new_count != 1 else ''}** added to the ban list.",
+                ephemeral=True
+            )
+        except Exception:
+            log.exception(f"Error during manual sync for guild {guild.id}")
+            try:
+                await interaction.followup.send("Sync failed due to an internal error.", ephemeral=True)
+            except:
+                pass
+
+    asyncio.create_task(_run_sync())
+
+
 
 
 # -------------------- Events --------------------
