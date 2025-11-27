@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  spam-banner-bot:
+    image: spam-banner-bot
+    build:
+      context: .
+      dockerfile: Dockerfile-bot
+    # Load DISCORD_TOKEN / DATABASE_URL from a .env file in this directory
+    env_file:
+      - .env
+    restart: unless-stopped

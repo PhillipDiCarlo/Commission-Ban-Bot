@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+# Prevent Python from writing .pyc files and buffer logs
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# System deps for psycopg2 and friends
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps
+# (Create a requirements.txt in the root next to bot.py if you don't already have one)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the app
+COPY . .
+
+# Environment variables are expected from docker-compose/.env:
+# - DISCORD_TOKEN or DISCORD_BOT_TOKEN
+# - DATABASE_URL
+CMD ["python", "bot.py"]
