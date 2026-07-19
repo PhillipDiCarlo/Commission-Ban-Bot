@@ -473,7 +473,10 @@ async def enforce_bans_for_guild(
         return 0
 
     # All spammer IDs from DB (or override if provided)
-    ids = set(spammer_ids or get_spammer_ids())
+    if spammer_ids:
+        ids = set(spammer_ids)
+    else:
+        ids = set(await asyncio.to_thread(get_spammer_ids))
     if not ids:
         log.debug(f"No spammer IDs found for guild {guild.id}. Nothing to ban.")
         return 0
@@ -532,7 +535,7 @@ async def enforce_bans_for_guild(
             elif code == 10013:
                 # Unknown User — account deleted or otherwise nonexistent
                 log.info(f"User {uid} no longer exists on Discord. Removing from database.")
-                remove_spammer_id(uid)
+                await asyncio.to_thread(remove_spammer_id, uid)
 
             else:
                 log.debug(f"HTTP error banning {uid} in guild {guild.id}: {e}")
@@ -553,7 +556,7 @@ async def enforce_bans_once_global():
     # otherwise still looking healthy. Catching here means a bad cycle just gets skipped
     # and retried next time instead.
     try:
-        targets = get_enabled_configured_servers()
+        targets = await asyncio.to_thread(get_enabled_configured_servers)
     except Exception:
         log.exception("Failed to load enabled/configured servers; skipping this enforcement cycle.")
         return
@@ -561,7 +564,7 @@ async def enforce_bans_once_global():
         return
 
     try:
-        spammer_ids = get_spammer_ids()
+        spammer_ids = await asyncio.to_thread(get_spammer_ids)
     except Exception:
         log.exception("Failed to load spammer ids; skipping this enforcement cycle.")
         return
@@ -625,9 +628,9 @@ async def enforce_bans_loop_error(exc: BaseException):
     asyncio.create_task(_restart_after_backoff())
 
 
-def start_loop_if_needed():
+async def start_loop_if_needed():
     # Start loop only if there's at least one enabled+configured server
-    if get_enabled_configured_servers() and not enforce_bans_loop.is_running():
+    if await asyncio.to_thread(get_enabled_configured_servers) and not enforce_bans_loop.is_running():
         enforce_bans_loop.start()
 
 
@@ -704,7 +707,7 @@ class ReportReviewView(discord.ui.View):
             await interaction.response.send_message("You don't have permission to review reports.", ephemeral=True)
             return
 
-        report = get_report(self.report_id)
+        report = await asyncio.to_thread(get_report, self.report_id)
         if not report:
             await interaction.response.send_message("This report no longer exists.", ephemeral=True)
             return
@@ -725,7 +728,7 @@ class ReportReviewView(discord.ui.View):
             # two reviewers racing (or a click landing after someone else already decided)
             # can never desync the displayed status from whether the user actually got
             # banned.
-            won = decide_report(self.report_id, decision, interaction.user.id)
+            won = await asyncio.to_thread(decide_report, self.report_id, decision, interaction.user.id)
         except Exception:
             log.exception(f"Failed to record decision for report {self.report_id}")
             try:
@@ -738,7 +741,7 @@ class ReportReviewView(discord.ui.View):
             return
 
         if not won:
-            current = get_report(self.report_id)
+            current = await asyncio.to_thread(get_report, self.report_id)
             status = current["status"] if current else "unknown"
             await interaction.followup.send(
                 f"Already reviewed by someone else (status: {status}).", ephemeral=True
@@ -810,17 +813,17 @@ async def set_channel_cmd(interaction: discord.Interaction, channel: discord.Tex
         return
 
     # Read existing before update to detect first-time setup
-    info_before = get_server_info(guild.id)
-    upsert_server(guild.id, guild.owner_id)  # ensure row exists
-    set_info_channel(guild.id, channel.id)
+    info_before = await asyncio.to_thread(get_server_info, guild.id)
+    await asyncio.to_thread(upsert_server, guild.id, guild.owner_id)  # ensure row exists
+    await asyncio.to_thread(set_info_channel, guild.id, channel.id)
     await interaction.response.send_message(f"Info channel set to #{channel.name}.", ephemeral=True)
 
     # If first time and enabled, run enforcement for this guild only
-    info_after = get_server_info(guild.id)
+    info_after = await asyncio.to_thread(get_server_info, guild.id)
     if (not info_before or not info_before.get("info_channel_id")) and info_after and info_after.get("enabler"):
         await enforce_bans_for_guild(guild, channel.id)
     # Start background loop if needed
-    start_loop_if_needed()
+    await start_loop_if_needed()
 
 
 @banner_group.command(name="enable", description="Enable or disable automatic banning.")
@@ -838,11 +841,11 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
     except Exception:
         pass
 
-    # Update DB (still blocking, but very fast in practice)
-    upsert_server(guild.id, guild.owner_id)
-    set_enabler(guild.id, enabled)
+    # Update DB (offloaded to a worker thread so it doesn't stall the event loop)
+    await asyncio.to_thread(upsert_server, guild.id, guild.owner_id)
+    await asyncio.to_thread(set_enabler, guild.id, enabled)
 
-    info = get_server_info(guild.id)
+    info = await asyncio.to_thread(get_server_info, guild.id)
     note = ""
     run_now = False
     if enabled and info and info.get("info_channel_id"):
@@ -864,7 +867,7 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
         async def _run_enforcement():
             try:
                 await enforce_bans_for_guild(guild, info["info_channel_id"])
-                start_loop_if_needed()
+                await start_loop_if_needed()
             except Exception:
                 log.exception(f"Error running initial enforcement for guild {guild.id}")
 
@@ -878,7 +881,7 @@ async def status_cmd(interaction: discord.Interaction):
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
-    info = get_server_info(guild.id)
+    info = await asyncio.to_thread(get_server_info, guild.id)
     if not info:
         await interaction.response.send_message("No settings found. Use /banner set-channel and /banner enable.", ephemeral=True)
         return
@@ -897,7 +900,7 @@ async def sync_now_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
 
-    info = get_server_info(guild.id)
+    info = await asyncio.to_thread(get_server_info, guild.id)
     if not info or not info.get("info_channel_id"):
         await interaction.response.send_message(
             "Info channel is not set yet. Use /banner set-channel first.",
@@ -959,11 +962,11 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         )
         return
 
-    if is_spammer_id(target_id):
+    if await asyncio.to_thread(is_spammer_id, target_id):
         await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
         return
 
-    if get_pending_report_for_target(target_id):
+    if await asyncio.to_thread(get_pending_report_for_target, target_id):
         await interaction.response.send_message("That user already has a pending report.", ephemeral=True)
         return
 
@@ -987,7 +990,7 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         target_user = None
 
     try:
-        report_id = create_report(target_id, interaction.user.id, guild.id)
+        report_id = await asyncio.to_thread(create_report, target_id, interaction.user.id, guild.id)
     except psycopg2.IntegrityError:
         # The one-pending-report-per-target unique index caught a race that the earlier
         # get_pending_report_for_target check missed (two reports for the same target
@@ -1020,11 +1023,11 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         view = ReportReviewView(report_id)
 
         message = await review_channel.send(embed=embed, file=discord_file, view=view)
-        set_report_review_message(report_id, message.id)
+        await asyncio.to_thread(set_report_review_message, report_id, message.id)
     except Exception:
         log.exception(f"Failed to post report {report_id} to review channel; removing orphaned report row")
         try:
-            delete_report(report_id)
+            await asyncio.to_thread(delete_report, report_id)
         except Exception:
             log.exception(f"Failed to clean up orphaned report {report_id}")
         await interaction.followup.send("Failed to submit report due to an internal error. Please try again.", ephemeral=True)
@@ -1044,7 +1047,7 @@ async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
         await interaction.response.send_message("You don't have permission to manage reports.", ephemeral=True)
         return
 
-    report = get_report(report_id)
+    report = await asyncio.to_thread(get_report, report_id)
     if not report:
         await interaction.response.send_message(f"No report with id #{report_id}.", ephemeral=True)
         return
@@ -1054,7 +1057,7 @@ async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
         )
         return
 
-    delete_report(report_id)
+    await asyncio.to_thread(delete_report, report_id)
     await interaction.response.send_message(
         f"Report #{report_id} cancelled — that user can be reported again.", ephemeral=True
     )
@@ -1095,30 +1098,31 @@ async def _check_review_config_health():
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
-    ensure_tables()
+    await asyncio.to_thread(ensure_tables)
 
     # Ensure we have a row for each guild
     for g in bot.guilds:
-        upsert_server(g.id, g.owner_id)
+        await asyncio.to_thread(upsert_server, g.id, g.owner_id)
 
     # Re-attach persistent Approve/Reject views for any reports still awaiting review,
     # otherwise their buttons stop working after this restart.
-    for report in get_all_pending_reports():
+    pending_reports = await asyncio.to_thread(get_all_pending_reports)
+    for report in pending_reports:
         bot.add_view(ReportReviewView(report["id"]), message_id=report["review_message_id"])
 
     await _check_review_config_health()
 
     # Run once globally (only for enabled+configured servers), then start loop if needed
     await enforce_bans_once_global()
-    start_loop_if_needed()
+    await start_loop_if_needed()
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     # Bot added to a new server
-    upsert_server(guild.id, guild.owner_id)
+    await asyncio.to_thread(upsert_server, guild.id, guild.owner_id)
     # Do not enforce until channel is set and enabled
-    start_loop_if_needed()
+    await start_loop_if_needed()
 
 
 # -------------------- Entry --------------------
