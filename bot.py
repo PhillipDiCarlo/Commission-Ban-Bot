@@ -897,4 +897,5 @@ async def on_guild_join(guild: discord.Guild):
 
 
 # -------------------- Entry --------------------
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
