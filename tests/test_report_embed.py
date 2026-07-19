@@ -158,7 +158,9 @@ class BuildReportEmbedTests(unittest.TestCase):
         self.assertNotIn("fallback_name", target_field.value)
 
     def test_target_user_without_global_name_falls_back_to_name(self):
-        user = StubUser(global_name=None, name="fallback_name", avatar_url="https://cdn.example/avatar2.png")
+        # Deliberately no markdown-special characters in this name -- escaping behavior
+        # has its own dedicated test below.
+        user = StubUser(global_name=None, name="fallbackname", avatar_url="https://cdn.example/avatar2.png")
         embed = bot.build_report_embed(
             report_id=1,
             target_id=123456789012345678,
@@ -169,7 +171,7 @@ class BuildReportEmbedTests(unittest.TestCase):
         )
         target_field = discord.utils.get(embed.fields, name="Target")
         self.assertIsNotNone(target_field)
-        self.assertIn("fallback_name", target_field.value)
+        self.assertIn("fallbackname", target_field.value)
 
     def test_target_user_sets_thumbnail_to_avatar_url(self):
         user = StubUser(global_name="Global Nick", name="fallback_name", avatar_url="https://cdn.example/avatar3.png")
@@ -255,6 +257,45 @@ class BuildReportEmbedTests(unittest.TestCase):
         self.assertIsNotNone(reported_field)
         self.assertIn("222", reported_field.value)
         self.assertIn("My Cool Server", reported_field.value)
+
+    # ---- markdown escaping (attacker-controlled server/display names) ----
+
+    def test_reporter_server_name_is_markdown_escaped(self):
+        # A malicious admin can rename their server to a masked-link pattern
+        # ("[text](url)") to inject a disguised clickable link into this bot-posted,
+        # reviewer-trusted embed. Verified empirically that discord.py 2.6.4's
+        # escape_markdown neutralizes this exact pattern by escaping the leading "[".
+        malicious_name = "[Click here for free nitro](https://evil.example)"
+        embed = bot.build_report_embed(
+            report_id=1,
+            target_id=123456789012345678,
+            target_user=None,
+            reporter_id=111,
+            reporter_server_name=malicious_name,
+            filename="evidence.png",
+        )
+        reported_field = discord.utils.get(embed.fields, name="Reported by")
+        self.assertIsNotNone(reported_field)
+        # The raw string is trivially still a substring of the escaped output (only a
+        # backslash was prepended before "["), so the meaningful check is that the
+        # escaping backslash is actually there -- that's what stops Discord from
+        # rendering it as a clickable masked link.
+        self.assertIn("\\[Click here for free nitro](https://evil.example)", reported_field.value)
+
+    def test_target_display_name_is_markdown_escaped(self):
+        user = StubUser(global_name="__sneaky__", name="fallbackname", avatar_url="https://cdn.example/avatar4.png")
+        embed = bot.build_report_embed(
+            report_id=1,
+            target_id=123456789012345678,
+            target_user=user,
+            reporter_id=111,
+            reporter_server_name="Test Server",
+            filename="evidence.png",
+        )
+        target_field = discord.utils.get(embed.fields, name="Target")
+        self.assertIsNotNone(target_field)
+        self.assertNotIn("__sneaky__", target_field.value)
+        self.assertIn("\\_\\_sneaky\\_\\_", target_field.value)
 
 
 if __name__ == "__main__":

@@ -126,5 +126,40 @@ class TestSnowflakeValidation(unittest.TestCase):
         self.assertIsNone(bot.SNOWFLAKE_RE.match("\n123456789012345678"))
 
 
+class TestIsValidSnowflake(unittest.TestCase):
+    """
+    bot.is_valid_snowflake(value) = SNOWFLAKE_RE.match(value) AND value fits in a
+    Postgres BIGINT (max 9223372036854775807, 19 digits). Added after the
+    adversarial review found that SNOWFLAKE_RE's digit-count check alone (15-20
+    digits) lets through values that overflow BIGINT -- report_cmd's
+    create_report() insert would then throw unguarded.
+    """
+
+    def test_realistic_id_is_valid(self):
+        self.assertTrue(bot.is_valid_snowflake("123456789012345678"))
+
+    def test_bigint_max_is_valid(self):
+        self.assertTrue(bot.is_valid_snowflake(str(bot.DISCORD_MAX_SNOWFLAKE)))
+
+    def test_bigint_max_plus_one_is_invalid(self):
+        self.assertFalse(bot.is_valid_snowflake(str(bot.DISCORD_MAX_SNOWFLAKE + 1)))
+
+    def test_twenty_digit_value_within_regex_but_overflowing_bigint_is_invalid(self):
+        # 20 nines: 20 digits (within SNOWFLAKE_RE's 15-20 range) but far larger than
+        # BIGINT's ~9.2e18 max -- exactly the gap the adversarial review flagged.
+        self.assertFalse(bot.is_valid_snowflake("9" * 20))
+
+    def test_nineteen_nines_overflows_bigint_despite_being_nineteen_digits(self):
+        # BIGINT max is also 19 digits, so digit-count alone can't distinguish this from
+        # a valid 19-digit ID -- only the numeric comparison catches it.
+        self.assertFalse(bot.is_valid_snowflake("9999999999999999999"))
+
+    def test_non_matching_string_is_invalid(self):
+        self.assertFalse(bot.is_valid_snowflake("not-a-snowflake"))
+
+    def test_too_short_is_invalid(self):
+        self.assertFalse(bot.is_valid_snowflake("1" * 14))
+
+
 if __name__ == "__main__":
     unittest.main()

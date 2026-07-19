@@ -81,10 +81,14 @@ python .\bot.py
 - `/banner status` — show current settings
 - `/banner sync-now` — trigger a one-time scan for this server
 - `/banner report <user_id> <evidence>` — report a suspected scammer's numeric Discord user ID,
-  with a screenshot as evidence. Posts to a global review channel (set via `REVIEW_CHANNEL_ID`)
-  where anyone holding `REVIEW_ROLE_ID` in that server can Approve (adds the ID to the ban list)
-  or Reject via buttons on the report message. Requires `REVIEW_CHANNEL_ID`/`REVIEW_ROLE_ID` to
-  be configured; otherwise the command replies that reporting isn't set up yet.
+  with a screenshot (image file, max 8 MB) as evidence. Posts to a global review channel (set via
+  `REVIEW_CHANNEL_ID`) where anyone holding `REVIEW_ROLE_ID` in that server can Approve (adds the
+  ID to the ban list) or Reject via buttons on the report message. Requires
+  `REVIEW_CHANNEL_ID`/`REVIEW_ROLE_ID` to be configured; otherwise the command replies that
+  reporting isn't set up yet.
+- `/banner report-cancel <report_id>` — cancel a stuck pending report (e.g. its review message
+  was deleted). Restricted to members holding `REVIEW_ROLE_ID`, same as the Approve/Reject
+  buttons.
 
 Notes:
 - The bot needs the “Ban Members” permission.

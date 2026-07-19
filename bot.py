@@ -42,13 +42,40 @@ logging.basicConfig(
 if not DATABASE_URL or not DISCORD_TOKEN:
     raise RuntimeError("Missing DATABASE_URL or DISCORD_TOKEN in environment.")
 
-# Optional: report/review queue config. If unset, /banner report is disabled.
+log = logging.getLogger("bot_banner")
+
+
+def _parse_optional_int_env(raw: Optional[str], name: str) -> Optional[int]:
+    """Parse an optional env var as an int without taking the whole bot down on a typo."""
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(f"{name} is set but isn't a valid integer ({raw!r}); the report/review feature will be disabled.")
+        return None
+
+
+# Optional: report/review queue config. If unset (or malformed), /banner report is disabled,
+# but the rest of the bot (core ban enforcement) still starts normally.
 _REVIEW_CHANNEL_ID_RAW = os.getenv("REVIEW_CHANNEL_ID")
 _REVIEW_ROLE_ID_RAW = os.getenv("REVIEW_ROLE_ID")
-REVIEW_CHANNEL_ID = int(_REVIEW_CHANNEL_ID_RAW) if _REVIEW_CHANNEL_ID_RAW else None
-REVIEW_ROLE_ID = int(_REVIEW_ROLE_ID_RAW) if _REVIEW_ROLE_ID_RAW else None
+REVIEW_CHANNEL_ID = _parse_optional_int_env(_REVIEW_CHANNEL_ID_RAW, "REVIEW_CHANNEL_ID")
+REVIEW_ROLE_ID = _parse_optional_int_env(_REVIEW_ROLE_ID_RAW, "REVIEW_ROLE_ID")
 
 SNOWFLAKE_RE = re.compile(r"^\d{15,20}$")
+# Postgres BIGINT max — SNOWFLAKE_RE's digit-count check alone lets through values that
+# would overflow the column (up to 20 digits; BIGINT tops out at 19).
+DISCORD_MAX_SNOWFLAKE = 9223372036854775807
+
+
+def is_valid_snowflake(value: str) -> bool:
+    if not SNOWFLAKE_RE.match(value):
+        return False
+    return int(value) <= DISCORD_MAX_SNOWFLAKE
+
+
+MAX_EVIDENCE_SIZE_BYTES = 8 * 1024 * 1024  # 8 MiB
 
 # Intents: do NOT enable privileged members intent
 intents = discord.Intents.none()
@@ -79,8 +106,6 @@ class BotBanner(discord.Client):
 
 
 bot = BotBanner()
-
-log = logging.getLogger("bot_banner")
 
 
 # -------------------- DB Helpers --------------------
@@ -123,6 +148,15 @@ def ensure_tables():
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                         decided_at TIMESTAMPTZ
                     );
+                    """
+                )
+                # At most one pending report per target at a time — closes the race where
+                # two reports for the same user get created within the same instant.
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS reports_one_pending_per_target
+                    ON public.reports (target_user_id)
+                    WHERE status = 'pending';
                     """
                 )
     finally:
@@ -236,19 +270,6 @@ def get_enabled_configured_servers() -> List[Tuple[int, int]]:
         conn.close()
 
 
-def add_spammer_id(discord_id: int):
-    conn = get_db_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO public.users (discord_id) VALUES (%s) ON CONFLICT DO NOTHING;",
-                    (discord_id,),
-                )
-    finally:
-        conn.close()
-
-
 def is_spammer_id(discord_id: int) -> bool:
     conn = get_db_connection()
     try:
@@ -327,19 +348,50 @@ def get_report(report_id: int) -> Optional[dict]:
         conn.close()
 
 
-def decide_report(report_id: int, status: str, reviewer_user_id: int):
+def decide_report(report_id: int, status: str, reviewer_user_id: int) -> bool:
+    """
+    Atomically transition a report from 'pending' to the given status, and — if
+    approving — add the target to the ban list in the *same* transaction.
+
+    Returns True if this call actually performed the transition, False if the
+    report was no longer 'pending' by the time this ran (e.g. another reviewer
+    already decided it). The WHERE clause + single transaction is what makes
+    this safe under two reviewers racing: at most one caller's UPDATE can match
+    a row, so the ban-list insert can only ever fire for whichever decision
+    actually won, never for a decision that lost the race.
+    """
     conn = get_db_connection()
     try:
         with conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
                     UPDATE public.reports
                     SET status = %s, reviewer_user_id = %s, decided_at = now()
-                    WHERE id = %s;
+                    WHERE id = %s AND status = 'pending'
+                    RETURNING target_user_id;
                     """,
                     (status, reviewer_user_id, report_id),
                 )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                if status == "approved":
+                    cur.execute(
+                        "INSERT INTO public.users (discord_id) VALUES (%s) ON CONFLICT DO NOTHING;",
+                        (row["target_user_id"],),
+                    )
+                return True
+    finally:
+        conn.close()
+
+
+def delete_report(report_id: int):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM public.reports WHERE id = %s;", (report_id,))
     finally:
         conn.close()
 
@@ -541,7 +593,7 @@ def build_report_embed(
     embed = discord.Embed(title=f"Spammer Report #{report_id}", color=color)
 
     if target_user:
-        display = target_user.global_name or target_user.name
+        display = discord.utils.escape_markdown(target_user.global_name or target_user.name)
         embed.add_field(name="Target", value=f"{display} — <@{target_id}> (`{target_id}`)", inline=False)
         embed.set_thumbnail(url=target_user.display_avatar.url)
     else:
@@ -549,7 +601,11 @@ def build_report_embed(
 
     created = discord.utils.snowflake_time(target_id)
     embed.add_field(name="Account created", value=discord.utils.format_dt(created, style="R"), inline=True)
-    embed.add_field(name="Reported by", value=f"<@{reporter_id}> in {reporter_server_name}", inline=True)
+    # reporter_server_name is an attacker-influenceable Discord server name (any admin can set
+    # it to anything, including markdown that could otherwise mask a phishing link in this
+    # trusted bot's embed) — escape it before interpolating.
+    safe_server_name = discord.utils.escape_markdown(reporter_server_name)
+    embed.add_field(name="Reported by", value=f"<@{reporter_id}> in {safe_server_name}", inline=True)
     embed.set_image(url=f"attachment://{filename}")
 
     if status == "pending":
@@ -608,9 +664,33 @@ class ReportReviewView(discord.ui.View):
         await interaction.response.defer()
 
         target_id = int(report["target_user_id"])
-        if decision == "approved":
-            add_spammer_id(target_id)
-        decide_report(self.report_id, decision, interaction.user.id)
+
+        try:
+            # decide_report is the single source of truth for the transition: it only
+            # succeeds if the report was still 'pending' at the moment of the UPDATE, and
+            # adds the target to the ban list in the same transaction when approving — so
+            # two reviewers racing (or a click landing after someone else already decided)
+            # can never desync the displayed status from whether the user actually got
+            # banned.
+            won = decide_report(self.report_id, decision, interaction.user.id)
+        except Exception:
+            log.exception(f"Failed to record decision for report {self.report_id}")
+            try:
+                await interaction.followup.send(
+                    "Failed to record that decision due to an internal error. Please try again.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        if not won:
+            current = get_report(self.report_id)
+            status = current["status"] if current else "unknown"
+            await interaction.followup.send(
+                f"Already reviewed by someone else (status: {status}).", ephemeral=True
+            )
+            return
 
         try:
             target_user = await bot.fetch_user(target_id)
@@ -639,6 +719,8 @@ class ReportReviewView(discord.ui.View):
         try:
             await interaction.message.edit(embed=embed, view=self)
         except Exception as e:
+            # The decision itself is already durably recorded above; a failure here is
+            # cosmetic (message doesn't visually update), not a correctness problem.
             log.warning(f"Failed to update report message for report {self.report_id}: {e}")
 
 
@@ -804,7 +886,7 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         )
         return
 
-    if not SNOWFLAKE_RE.match(user_id):
+    if not is_valid_snowflake(user_id):
         await interaction.response.send_message(
             "That doesn't look like a valid Discord user ID (numbers only). "
             "Right-click the user and choose \"Copy User ID\" (Developer Mode must be enabled).",
@@ -813,6 +895,16 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         return
 
     target_id = int(user_id)
+
+    if not (evidence.content_type or "").startswith("image/"):
+        await interaction.response.send_message("Evidence must be an image file.", ephemeral=True)
+        return
+
+    if evidence.size > MAX_EVIDENCE_SIZE_BYTES:
+        await interaction.response.send_message(
+            f"Evidence file is too large (max {MAX_EVIDENCE_SIZE_BYTES // (1024 * 1024)} MB).", ephemeral=True
+        )
+        return
 
     if is_spammer_id(target_id):
         await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
@@ -841,31 +933,109 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
     except Exception:
         target_user = None
 
-    report_id = create_report(target_id, interaction.user.id, guild.id)
-
-    file_bytes = await evidence.read()
-    discord_file = discord.File(io.BytesIO(file_bytes), filename=evidence.filename)
-
-    embed = build_report_embed(
-        report_id,
-        target_id,
-        target_user,
-        interaction.user.id,
-        guild.name,
-        evidence.filename,
-        status="pending",
-    )
-    view = ReportReviewView(report_id)
-
     try:
-        message = await review_channel.send(embed=embed, file=discord_file, view=view)
-        set_report_review_message(report_id, message.id)
+        report_id = create_report(target_id, interaction.user.id, guild.id)
+    except psycopg2.IntegrityError:
+        # The one-pending-report-per-target unique index caught a race that the earlier
+        # get_pending_report_for_target check missed (two reports for the same target
+        # submitted within the same instant).
+        await interaction.followup.send("That user already has a pending report.", ephemeral=True)
+        return
     except Exception:
-        log.exception(f"Failed to post report {report_id} to review channel")
+        log.exception(f"Failed to create report row for target {target_id}")
         await interaction.followup.send("Failed to submit report due to an internal error.", ephemeral=True)
         return
 
+    # From here on, a report row exists. Anything below that fails must delete it —
+    # otherwise it's stuck at status='pending' forever with no review_message_id, which
+    # (a) permanently blocks anyone from ever reporting this target_id again, and
+    # (b) is invisible to the restart-rehydration query (it only looks at rows that DO
+    # have a review_message_id), so it would never self-heal.
+    try:
+        file_bytes = await evidence.read()
+        discord_file = discord.File(io.BytesIO(file_bytes), filename=evidence.filename)
+
+        embed = build_report_embed(
+            report_id,
+            target_id,
+            target_user,
+            interaction.user.id,
+            guild.name,
+            evidence.filename,
+            status="pending",
+        )
+        view = ReportReviewView(report_id)
+
+        message = await review_channel.send(embed=embed, file=discord_file, view=view)
+        set_report_review_message(report_id, message.id)
+    except Exception:
+        log.exception(f"Failed to post report {report_id} to review channel; removing orphaned report row")
+        try:
+            delete_report(report_id)
+        except Exception:
+            log.exception(f"Failed to clean up orphaned report {report_id}")
+        await interaction.followup.send("Failed to submit report due to an internal error. Please try again.", ephemeral=True)
+        return
+
     await interaction.followup.send(f"Report submitted (#{report_id}) and is awaiting review.", ephemeral=True)
+
+
+@banner_group.command(name="report-cancel", description="Cancel a stuck pending report (review team only).")
+@app_commands.describe(report_id="The report ID to cancel")
+async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
+    # Permission here mirrors the review-role gate on the Approve/Reject buttons, not
+    # admin_only() — this is a review-team action, not a per-server admin one, since it
+    # operates on the single global review queue.
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if REVIEW_ROLE_ID is None or not member or not member.get_role(REVIEW_ROLE_ID):
+        await interaction.response.send_message("You don't have permission to manage reports.", ephemeral=True)
+        return
+
+    report = get_report(report_id)
+    if not report:
+        await interaction.response.send_message(f"No report with id #{report_id}.", ephemeral=True)
+        return
+    if report["status"] != "pending":
+        await interaction.response.send_message(
+            f"Report #{report_id} is already {report['status']}, nothing to cancel.", ephemeral=True
+        )
+        return
+
+    delete_report(report_id)
+    await interaction.response.send_message(
+        f"Report #{report_id} cancelled — that user can be reported again.", ephemeral=True
+    )
+
+
+async def _check_review_config_health():
+    """
+    Log a clear, visible warning at startup if REVIEW_CHANNEL_ID/REVIEW_ROLE_ID are set but
+    don't actually resolve (channel deleted/inaccessible, or role deleted from the guild).
+    Without this, that failure mode is completely silent — reports would just quietly pile up
+    unreviewable with nothing telling the operator why.
+    """
+    if REVIEW_CHANNEL_ID is None or REVIEW_ROLE_ID is None:
+        return
+
+    review_channel = bot.get_channel(REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        try:
+            review_channel = await bot.fetch_channel(REVIEW_CHANNEL_ID)
+        except Exception:
+            review_channel = None
+
+    if review_channel is None:
+        log.warning(
+            f"REVIEW_CHANNEL_ID {REVIEW_CHANNEL_ID} could not be resolved; /banner report will fail to post."
+        )
+        return
+
+    guild = getattr(review_channel, "guild", None)
+    if guild is not None and guild.get_role(REVIEW_ROLE_ID) is None:
+        log.warning(
+            f"REVIEW_ROLE_ID {REVIEW_ROLE_ID} does not exist in guild {guild.id}; "
+            "nobody will be able to approve/reject reports."
+        )
 
 
 # -------------------- Events --------------------
@@ -882,6 +1052,8 @@ async def on_ready():
     # otherwise their buttons stop working after this restart.
     for report in get_all_pending_reports():
         bot.add_view(ReportReviewView(report["id"]), message_id=report["review_message_id"])
+
+    await _check_review_config_health()
 
     # Run once globally (only for enabled+configured servers), then start loop if needed
     await enforce_bans_once_global()
