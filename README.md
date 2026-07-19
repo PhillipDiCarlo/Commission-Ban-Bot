@@ -10,7 +10,7 @@ Bot Banner is a Discord bot that uses slash commands only and bans by user ID fr
 - Auto enforcement runs:
   - when the bot comes online
   - the first time the info channel is set (if enabled)
-  - every 15 minutes in the background (if enabled)
+  - periodically in the background (every `ENFORCE_INTERVAL_HOURS`, default 24h, if enabled)
 - Skips any server that hasn’t set an info channel
 
 ## How it works
@@ -49,10 +49,21 @@ DISCORD_TOKEN=your_discord_bot_token
 # Optional:
 # LOG_LEVEL=INFO   # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
+# Optional: how often (in hours) the background job re-enforces the ban list across all
+# enabled+configured servers. Defaults to 24 (once a day).
+# ENFORCE_INTERVAL_HOURS=24
+
+# Optional: sync slash commands to a single guild instead of globally, for near-instant
+# propagation while developing (a global sync can take up to ~1hr to show up everywhere).
+# Leave unset in production.
+# DEV_GUILD_ID=123456789012345678
+
 # Optional, required only for /banner report:
 # REVIEW_CHANNEL_ID=123456789012345678   # channel where reports are posted for review
 # REVIEW_ROLE_ID=123456789012345678      # role (in that channel's server) allowed to approve/reject
 ```
+
+A ready-to-copy template lives at `.env.example`.
 
 3) Database tables
 
