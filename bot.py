@@ -1,4 +1,6 @@
 import os
+import io
+import re
 import asyncio
 import logging
 import random
@@ -39,6 +41,14 @@ logging.basicConfig(
 
 if not DATABASE_URL or not DISCORD_TOKEN:
     raise RuntimeError("Missing DATABASE_URL or DISCORD_TOKEN in environment.")
+
+# Optional: report/review queue config. If unset, /banner report is disabled.
+_REVIEW_CHANNEL_ID_RAW = os.getenv("REVIEW_CHANNEL_ID")
+_REVIEW_ROLE_ID_RAW = os.getenv("REVIEW_ROLE_ID")
+REVIEW_CHANNEL_ID = int(_REVIEW_CHANNEL_ID_RAW) if _REVIEW_CHANNEL_ID_RAW else None
+REVIEW_ROLE_ID = int(_REVIEW_ROLE_ID_RAW) if _REVIEW_ROLE_ID_RAW else None
+
+SNOWFLAKE_RE = re.compile(r"^\d{15,20}$")
 
 # Intents: do NOT enable privileged members intent
 intents = discord.Intents.none()
@@ -97,6 +107,21 @@ def ensure_tables():
                         owner_id BIGINT NOT NULL,
                         info_channel_id BIGINT,
                         enabler BOOLEAN NOT NULL DEFAULT FALSE
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.reports (
+                        id SERIAL PRIMARY KEY,
+                        target_user_id BIGINT NOT NULL,
+                        reporter_user_id BIGINT NOT NULL,
+                        reporter_server_id BIGINT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        reviewer_user_id BIGINT,
+                        review_message_id BIGINT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        decided_at TIMESTAMPTZ
                     );
                     """
                 )
@@ -207,6 +232,130 @@ def get_enabled_configured_servers() -> List[Tuple[int, int]]:
                 """
             )
             return [(int(r[0]), int(r[1])) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def add_spammer_id(discord_id: int):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.users (discord_id) VALUES (%s) ON CONFLICT DO NOTHING;",
+                    (discord_id,),
+                )
+    finally:
+        conn.close()
+
+
+def is_spammer_id(discord_id: int) -> bool:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.users WHERE discord_id = %s;", (discord_id,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def create_report(target_user_id: int, reporter_user_id: int, reporter_server_id: int) -> int:
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.reports (target_user_id, reporter_user_id, reporter_server_id)
+                    VALUES (%s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (target_user_id, reporter_user_id, reporter_server_id),
+                )
+                return int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
+def set_report_review_message(report_id: int, message_id: int):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.reports SET review_message_id = %s WHERE id = %s;",
+                    (message_id, report_id),
+                )
+    finally:
+        conn.close()
+
+
+def get_pending_report_for_target(target_user_id: int) -> Optional[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id FROM public.reports
+                WHERE target_user_id = %s AND status = 'pending'
+                LIMIT 1;
+                """,
+                (target_user_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_report(report_id: int) -> Optional[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, target_user_id, reporter_user_id, reporter_server_id,
+                       status, reviewer_user_id, review_message_id
+                FROM public.reports
+                WHERE id = %s;
+                """,
+                (report_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def decide_report(report_id: int, status: str, reviewer_user_id: int):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE public.reports
+                    SET status = %s, reviewer_user_id = %s, decided_at = now()
+                    WHERE id = %s;
+                    """,
+                    (status, reviewer_user_id, report_id),
+                )
+    finally:
+        conn.close()
+
+
+def get_all_pending_reports() -> List[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, review_message_id
+                FROM public.reports
+                WHERE status = 'pending' AND review_message_id IS NOT NULL;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -377,6 +526,127 @@ def start_loop_if_needed():
         enforce_bans_loop.start()
 
 
+# -------------------- Report / Review Queue --------------------
+def build_report_embed(
+    report_id: int,
+    target_id: int,
+    target_user: Optional[discord.User],
+    reporter_id: int,
+    reporter_server_name: str,
+    filename: str,
+    status: str = "pending",
+    reviewer_id: Optional[int] = None,
+) -> discord.Embed:
+    color = {"pending": discord.Color.gold(), "approved": discord.Color.green(), "rejected": discord.Color.red()}[status]
+    embed = discord.Embed(title=f"Spammer Report #{report_id}", color=color)
+
+    if target_user:
+        display = target_user.global_name or target_user.name
+        embed.add_field(name="Target", value=f"{display} — <@{target_id}> (`{target_id}`)", inline=False)
+        embed.set_thumbnail(url=target_user.display_avatar.url)
+    else:
+        embed.add_field(name="Target", value=f"<@{target_id}> (`{target_id}`)\n*(profile lookup failed — account may be deleted)*", inline=False)
+
+    created = discord.utils.snowflake_time(target_id)
+    embed.add_field(name="Account created", value=discord.utils.format_dt(created, style="R"), inline=True)
+    embed.add_field(name="Reported by", value=f"<@{reporter_id}> in {reporter_server_name}", inline=True)
+    embed.set_image(url=f"attachment://{filename}")
+
+    if status == "pending":
+        embed.set_footer(text="Awaiting review")
+    elif status == "approved":
+        embed.set_footer(text=f"Approved by {reviewer_id} — added to the ban list")
+    elif status == "rejected":
+        embed.set_footer(text=f"Rejected by {reviewer_id}")
+
+    return embed
+
+
+class ReportReviewView(discord.ui.View):
+    def __init__(self, report_id: int):
+        super().__init__(timeout=None)
+        self.report_id = report_id
+
+        approve = discord.ui.Button(
+            style=discord.ButtonStyle.green,
+            label="Approve",
+            emoji="✅",
+            custom_id=f"report_approve:{report_id}",
+        )
+        reject = discord.ui.Button(
+            style=discord.ButtonStyle.red,
+            label="Reject",
+            emoji="❌",
+            custom_id=f"report_reject:{report_id}",
+        )
+        approve.callback = self._make_callback("approved")
+        reject.callback = self._make_callback("rejected")
+        self.add_item(approve)
+        self.add_item(reject)
+
+    def _make_callback(self, decision: str):
+        async def callback(interaction: discord.Interaction):
+            await self._handle_decision(interaction, decision)
+        return callback
+
+    async def _handle_decision(self, interaction: discord.Interaction, decision: str):
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if REVIEW_ROLE_ID is None or not member or not member.get_role(REVIEW_ROLE_ID):
+            await interaction.response.send_message("You don't have permission to review reports.", ephemeral=True)
+            return
+
+        report = get_report(self.report_id)
+        if not report:
+            await interaction.response.send_message("This report no longer exists.", ephemeral=True)
+            return
+        if report["status"] != "pending":
+            await interaction.response.send_message(
+                f"Already reviewed (status: {report['status']}).", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        target_id = int(report["target_user_id"])
+        if decision == "approved":
+            add_spammer_id(target_id)
+        decide_report(self.report_id, decision, interaction.user.id)
+
+        try:
+            target_user = await bot.fetch_user(target_id)
+        except Exception:
+            target_user = None
+
+        message = interaction.message
+        filename = "evidence.png"
+        if message and message.attachments:
+            filename = message.attachments[0].filename
+
+        embed = build_report_embed(
+            self.report_id,
+            target_id,
+            target_user,
+            int(report["reporter_user_id"]),
+            _guild_name_for(int(report["reporter_server_id"])),
+            filename,
+            status=decision,
+            reviewer_id=interaction.user.id,
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception as e:
+            log.warning(f"Failed to update report message for report {self.report_id}: {e}")
+
+
+def _guild_name_for(server_id: int) -> str:
+    guild = bot.get_guild(server_id)
+    return guild.name if guild else f"server `{server_id}`"
+
+
 # -------------------- Checks and Commands --------------------
 def admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -519,6 +789,83 @@ async def sync_now_cmd(interaction: discord.Interaction):
     asyncio.create_task(_run_sync())
 
 
+@banner_group.command(name="report", description="Report a user ID as a commission scammer for review.")
+@app_commands.describe(user_id="The numeric Discord user ID of the suspected scammer", evidence="Screenshot proving the claim")
+@admin_only()
+async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: discord.Attachment):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    if REVIEW_CHANNEL_ID is None or REVIEW_ROLE_ID is None:
+        await interaction.response.send_message(
+            "Reporting isn't configured on this bot yet.", ephemeral=True
+        )
+        return
+
+    if not SNOWFLAKE_RE.match(user_id):
+        await interaction.response.send_message(
+            "That doesn't look like a valid Discord user ID (numbers only). "
+            "Right-click the user and choose \"Copy User ID\" (Developer Mode must be enabled).",
+            ephemeral=True,
+        )
+        return
+
+    target_id = int(user_id)
+
+    if is_spammer_id(target_id):
+        await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
+        return
+
+    if get_pending_report_for_target(target_id):
+        await interaction.response.send_message("That user already has a pending report.", ephemeral=True)
+        return
+
+    review_channel = bot.get_channel(REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        try:
+            review_channel = await bot.fetch_channel(REVIEW_CHANNEL_ID)
+        except Exception:
+            review_channel = None
+    if not isinstance(review_channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            "The review channel is misconfigured; please contact the bot owner.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        target_user = await bot.fetch_user(target_id)
+    except Exception:
+        target_user = None
+
+    report_id = create_report(target_id, interaction.user.id, guild.id)
+
+    file_bytes = await evidence.read()
+    discord_file = discord.File(io.BytesIO(file_bytes), filename=evidence.filename)
+
+    embed = build_report_embed(
+        report_id,
+        target_id,
+        target_user,
+        interaction.user.id,
+        guild.name,
+        evidence.filename,
+        status="pending",
+    )
+    view = ReportReviewView(report_id)
+
+    try:
+        message = await review_channel.send(embed=embed, file=discord_file, view=view)
+        set_report_review_message(report_id, message.id)
+    except Exception:
+        log.exception(f"Failed to post report {report_id} to review channel")
+        await interaction.followup.send("Failed to submit report due to an internal error.", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"Report submitted (#{report_id}) and is awaiting review.", ephemeral=True)
 
 
 # -------------------- Events --------------------
@@ -530,6 +877,11 @@ async def on_ready():
     # Ensure we have a row for each guild
     for g in bot.guilds:
         upsert_server(g.id, g.owner_id)
+
+    # Re-attach persistent Approve/Reject views for any reports still awaiting review,
+    # otherwise their buttons stop working after this restart.
+    for report in get_all_pending_reports():
+        bot.add_view(ReportReviewView(report["id"]), message_id=report["review_message_id"])
 
     # Run once globally (only for enabled+configured servers), then start loop if needed
     await enforce_bans_once_global()
