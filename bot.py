@@ -4,7 +4,7 @@ import re
 import asyncio
 import logging
 import random
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 
 import discord
 from discord import app_commands
@@ -189,6 +189,19 @@ def ensure_tables():
                     WHERE status = 'pending';
                     """
                 )
+                # Local record of (guild, user) pairs this bot has already confirmed
+                # banned, so enforce_bans_for_guild can diff against this instead of
+                # re-downloading the guild's entire live ban list from Discord every
+                # enforcement cycle (see enforce_bans_for_guild's docstring).
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.enforced_bans (
+                        server_id BIGINT NOT NULL,
+                        discord_id BIGINT NOT NULL,
+                        PRIMARY KEY (server_id, discord_id)
+                    );
+                    """
+                )
     finally:
         conn.close()
 
@@ -231,6 +244,39 @@ def remove_spammer_id(discord_id: int):
                 cur.execute(
                     "DELETE FROM public.users WHERE discord_id = %s;",
                     (discord_id,)
+                )
+    finally:
+        conn.close()
+
+
+def get_enforced_ban_ids(server_id: int) -> Set[int]:
+    """Return the set of discord_ids already recorded as enforced (bot-confirmed banned) for this guild."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT discord_id FROM public.enforced_bans WHERE server_id = %s;",
+                (server_id,),
+            )
+            return {int(r[0]) for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def record_enforced_ban(server_id: int, discord_id: int):
+    """Record that discord_id has been confirmed banned in server_id, so future enforcement
+    cycles skip it without needing to re-check Discord's live ban list."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.enforced_bans (server_id, discord_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING;
+                    """,
+                    (server_id, discord_id),
                 )
     finally:
         conn.close()
@@ -464,10 +510,30 @@ async def enforce_bans_for_guild(
     guild: discord.Guild,
     info_channel_id: int,
     spammer_ids: Optional[List[int]] = None,
+    force_refresh: bool = False,
 ) -> int:
     """
     Enforce bans for a single guild.
     Returns the number of *new* users added to the guild's ban list.
+
+    "Already handled" set — normal path vs. force_refresh:
+    Rather than recomputing the diff against Discord's live ban list every cycle (a
+    fully paginated guild.bans(limit=None) call that re-downloads the *entire* ban
+    list purely to compute a set difference that usually changes by a handful of IDs
+    cycle over cycle — expensive and slow for large lists, which is the whole point
+    of this bot), the normal automatic path diffs against a local Postgres record
+    (public.enforced_bans) of (guild, user) pairs this bot has already confirmed
+    banned. That's populated as bans succeed (and via the 30035 "already banned"
+    branch below), so it stays in sync without ever needing to re-fetch Discord's
+    live list.
+
+    Trade-off: if a moderator manually *unbans* someone through Discord's own UI, the
+    local record still says "banned", so the normal automatic path won't notice or
+    re-ban them. That's accepted as the cost of the routine cycle. For cases that
+    need Discord's live truth (e.g. reconciling after manual unbans, or catching up
+    on bans that happened before this table existed), pass force_refresh=True — used
+    by the manual /banner sync-now command — which still pulls the live ban list and
+    backfills anything found there into enforced_bans before computing the diff.
     """
     if not guild or not info_channel_id:
         return 0
@@ -478,15 +544,31 @@ async def enforce_bans_for_guild(
         log.debug(f"No spammer IDs found for guild {guild.id}. Nothing to ban.")
         return 0
 
-    # Fetch current bans from Discord
-    already_banned_ids: set[int] = set()
+    # "Already handled" set: local record of IDs this bot has already confirmed
+    # banned in this guild, instead of re-fetching Discord's full live ban list.
     try:
-        async for ban_entry in guild.bans(limit=None):
-            already_banned_ids.add(ban_entry.user.id)
+        already_banned_ids: Set[int] = get_enforced_ban_ids(guild.id)
     except Exception as e:
-        log.debug(f"Failed to fetch ban list in guild {guild.id}: {e}")
+        log.debug(f"Failed to load enforced ban cache for guild {guild.id}: {e}")
+        already_banned_ids = set()
 
-    # Only ban IDs that are NOT already banned
+    if force_refresh:
+        # Manual reconciliation path (/banner sync-now): pull Discord's live ban list
+        # and backfill anything found there that isn't recorded locally yet (e.g.
+        # banned manually by a moderator, or banned before enforced_bans existed).
+        try:
+            async for ban_entry in guild.bans(limit=None):
+                uid = ban_entry.user.id
+                if uid not in already_banned_ids:
+                    already_banned_ids.add(uid)
+                    try:
+                        record_enforced_ban(guild.id, uid)
+                    except Exception as e:
+                        log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
+        except Exception as e:
+            log.debug(f"Failed to fetch live ban list in guild {guild.id}: {e}")
+
+    # Only ban IDs that are NOT already banned/recorded
     to_ban = ids - already_banned_ids
     if not to_ban:
         log.debug(f"No new bans needed for guild {guild.id}.")
@@ -509,6 +591,10 @@ async def enforce_bans_for_guild(
             )
 
             new_ban_count += 1
+            try:
+                record_enforced_ban(guild.id, uid)
+            except Exception as e:
+                log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
 
             await asyncio.sleep(1.0)  # avoid rate limit issues
 
@@ -526,8 +612,17 @@ async def enforce_bans_for_guild(
             code = getattr(e, "code", None)
 
             if code == 30035:
-                # Already banned (Discord duplication)
-                pass
+                # Already banned (Discord duplication). Since the normal path no longer
+                # pre-checks Discord's live ban list, this is now the only way a user
+                # who was already banned by some other means (manually by a moderator,
+                # or before enforced_bans existed) gets backfilled into the local
+                # record -- without this, the bot would keep re-attempting (and
+                # re-hitting this same "already banned" error) for that user forever,
+                # every cycle.
+                try:
+                    record_enforced_ban(guild.id, uid)
+                except Exception as rec_e:
+                    log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {rec_e}")
 
             elif code == 10013:
                 # Unknown User — account deleted or otherwise nonexistent
@@ -538,7 +633,7 @@ async def enforce_bans_for_guild(
                 log.debug(f"HTTP error banning {uid} in guild {guild.id}: {e}")
 
             await asyncio.sleep(0.2)
-    
+
         except Exception as e:
             log.debug(f"Unexpected error banning {uid} in guild {guild.id}: {e}")
             await asyncio.sleep(0.2)
@@ -909,7 +1004,12 @@ async def sync_now_cmd(interaction: discord.Interaction):
 
     async def _run_sync():
         try:
-            new_count = await enforce_bans_for_guild(guild, info["info_channel_id"])
+            # force_refresh=True: this is the manual "make sure everything's actually
+            # in sync right now" escape hatch -- unlike the automatic cycle, it's fine
+            # (expected, even) for this to pay the cost of re-checking Discord's live
+            # ban list, since it also catches manual unbans / out-of-band bans that the
+            # cheaper local-cache diff used elsewhere can't see.
+            new_count = await enforce_bans_for_guild(guild, info["info_channel_id"], force_refresh=True)
             await interaction.followup.send(
                 f"Sync complete. **{new_count} new user{'s' if new_count != 1 else ''}** added to the ban list.",
                 ephemeral=True
