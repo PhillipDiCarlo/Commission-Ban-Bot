@@ -48,6 +48,10 @@ DISCORD_TOKEN=your_discord_bot_token
 
 # Optional:
 # LOG_LEVEL=INFO   # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Optional, required only for /banner report:
+# REVIEW_CHANNEL_ID=123456789012345678   # channel where reports are posted for review
+# REVIEW_ROLE_ID=123456789012345678      # role (in that channel's server) allowed to approve/reject
 ```
 
 3) Database tables
@@ -76,6 +80,15 @@ python .\bot.py
 - `/banner enable <true|false>` — toggle automatic enforcement for this server
 - `/banner status` — show current settings
 - `/banner sync-now` — trigger a one-time scan for this server
+- `/banner report <user_id> <evidence>` — report a suspected scammer's numeric Discord user ID,
+  with a screenshot (image file, max 8 MB) as evidence. Posts to a global review channel (set via
+  `REVIEW_CHANNEL_ID`) where anyone holding `REVIEW_ROLE_ID` in that server can Approve (adds the
+  ID to the ban list) or Reject via buttons on the report message. Requires
+  `REVIEW_CHANNEL_ID`/`REVIEW_ROLE_ID` to be configured; otherwise the command replies that
+  reporting isn't set up yet.
+- `/banner report-cancel <report_id>` — cancel a stuck pending report (e.g. its review message
+  was deleted). Restricted to members holding `REVIEW_ROLE_ID`, same as the Approve/Reject
+  buttons.
 
 Notes:
 - The bot needs the “Ban Members” permission.
