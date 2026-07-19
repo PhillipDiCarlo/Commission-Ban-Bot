@@ -21,7 +21,7 @@ Bot Banner
 - Runs automatically:
   * when the bot comes online (if info channel is configured and enabled)
   * when the info channel is set the first time (if enabled)
-  * periodically in the background (15 minutes) while enabled
+  * periodically in the background (every ENFORCE_INTERVAL_HOURS, default 24h) while enabled
 - Will not run if the info channel is not configured for the server
 """
 
@@ -52,7 +52,7 @@ def _parse_optional_int_env(raw: Optional[str], name: str) -> Optional[int]:
     try:
         return int(raw)
     except ValueError:
-        log.warning(f"{name} is set but isn't a valid integer ({raw!r}); the report/review feature will be disabled.")
+        log.warning(f"{name} is set but isn't a valid integer ({raw!r}); ignoring it.")
         return None
 
 
@@ -77,6 +77,28 @@ def is_valid_snowflake(value: str) -> bool:
 
 MAX_EVIDENCE_SIZE_BYTES = 8 * 1024 * 1024  # 8 MiB
 
+# Optional: sync slash commands to a single guild instead of globally. Guild-scoped syncs
+# propagate near-instantly (global syncs can take up to ~1hr), so set this during development
+# for fast iteration; leave unset in production for the normal global sync.
+DEV_GUILD_ID = _parse_optional_int_env(os.getenv("DEV_GUILD_ID"), "DEV_GUILD_ID")
+
+
+def _parse_float_env(raw: Optional[str], default: float, name: str) -> float:
+    """Parse an optional env var as a float, falling back to `default` (never raises)."""
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(f"{name} is set but isn't a valid number ({raw!r}); using the default of {default}.")
+        return default
+
+
+# How often the background job re-enforces the ban list across all enabled+configured
+# servers. Was hardcoded to 1 hour, which didn't match the actually-intended cadence
+# (once a day / every 12h); now configurable, defaulting to daily.
+ENFORCE_INTERVAL_HOURS = _parse_float_env(os.getenv("ENFORCE_INTERVAL_HOURS"), 24.0, "ENFORCE_INTERVAL_HOURS")
+
 # Intents: do NOT enable privileged members intent
 intents = discord.Intents.none()
 intents.guilds = True  # needed for guilds/channels and bans
@@ -99,8 +121,16 @@ class BotBanner(discord.Client):
         except Exception:
             pass
         try:
-            await self.tree.sync()
-            log.info("Application commands synced.")
+            if DEV_GUILD_ID is not None:
+                # Guild-scoped sync propagates near-instantly, unlike a global sync (up to
+                # ~1hr) -- much faster iteration while developing.
+                dev_guild = discord.Object(id=DEV_GUILD_ID)
+                self.tree.copy_global_to(guild=dev_guild)
+                await self.tree.sync(guild=dev_guild)
+                log.info(f"Application commands synced to dev guild {DEV_GUILD_ID}.")
+            else:
+                await self.tree.sync()
+                log.info("Application commands synced globally.")
         except Exception as e:
             log.warning(f"Command sync failed: {e}")
 
@@ -413,15 +443,6 @@ def get_all_pending_reports() -> List[dict]:
 
 
 # -------------------- Utilities --------------------
-async def fetch_username_safe(user_id: int) -> str:
-    try:
-        user = await bot.fetch_user(user_id)
-        display = user.global_name or user.name or str(user_id)
-        return f"{display} ({user.id})"
-    except Exception:
-        return f"{user_id}"
-
-
 async def send_info(guild: discord.Guild, channel_id: Optional[int], message: str):
     if not channel_id:
         return
@@ -475,10 +496,12 @@ async def enforce_bans_for_guild(
 
     for uid in to_ban:
         try:
-            # Only detect membership from cache (no intents)
-            was_member = guild.get_member(uid) is not None
-
-            # Attempt the ban
+            # Attempt the ban. There's deliberately no "was this user actually a member"
+            # check/notification here -- the bot runs without the privileged Members
+            # intent and with an empty member cache (see the module docstring), so
+            # guild.get_member() can't reliably tell membership apart from "not cached";
+            # a notification gated on that would be silently wrong almost all the time
+            # rather than actually informative.
             await guild.ban(
                 discord.Object(id=uid),
                 reason="Listed in commissionSpammer database",
@@ -486,15 +509,6 @@ async def enforce_bans_for_guild(
             )
 
             new_ban_count += 1
-
-            # Notify if the user was actually in the server at ban time
-            if was_member:
-                uname = await fetch_username_safe(uid)
-                await send_info(
-                    guild,
-                    info_channel_id,
-                    f"User {uname} was in the server and was removed and banned (on banlist).",
-                )
 
             await asyncio.sleep(1.0)  # avoid rate limit issues
 
@@ -532,11 +546,25 @@ async def enforce_bans_for_guild(
     return new_ban_count
 
 async def enforce_bans_once_global():
-    targets = get_enabled_configured_servers()
+    # These two DB calls used to be unguarded. When a discord.ext.tasks.Loop coroutine
+    # raises an unhandled exception, discord.py logs it and permanently cancels the loop
+    # (no auto-retry) -- so a single transient DB hiccup here used to silently kill all
+    # future scheduled enforcement for the rest of the process's life, with the bot
+    # otherwise still looking healthy. Catching here means a bad cycle just gets skipped
+    # and retried next time instead.
+    try:
+        targets = get_enabled_configured_servers()
+    except Exception:
+        log.exception("Failed to load enabled/configured servers; skipping this enforcement cycle.")
+        return
     if not targets:
         return
 
-    spammer_ids = get_spammer_ids()
+    try:
+        spammer_ids = get_spammer_ids()
+    except Exception:
+        log.exception("Failed to load spammer ids; skipping this enforcement cycle.")
+        return
     if not spammer_ids:
         return
 
@@ -563,13 +591,38 @@ async def enforce_bans_once_global():
             log.exception(f"Error enforcing bans in guild {server_id}: {e}")
 
 
-@tasks.loop(hours=1)
+@tasks.loop(hours=ENFORCE_INTERVAL_HOURS)
 async def enforce_bans_loop():
     # Add jitter of 0–300 seconds (0–5 minutes)
     jitter_seconds = random.randint(0, 300)
     log.info(f"Jitter delay before global ban enforcement: {jitter_seconds} seconds.")
     await asyncio.sleep(jitter_seconds)
-    await enforce_bans_once_global()
+    try:
+        await enforce_bans_once_global()
+    except Exception:
+        # enforce_bans_once_global already guards its own DB calls, so this shouldn't
+        # normally trigger -- but discord.py permanently cancels a tasks.Loop on any
+        # exception that escapes the coroutine (no auto-retry for non-network errors),
+        # so this is a last-resort backstop to make sure that never happens silently.
+        log.exception("Unhandled error during scheduled global ban enforcement; will retry next cycle.")
+
+
+@enforce_bans_loop.error
+async def enforce_bans_loop_error(exc: BaseException):
+    # If something still gets past the try/except above (a bug we didn't anticipate),
+    # discord.py has already logged it and is about to let the task die permanently.
+    # Schedule a delayed restart so a single unexpected failure doesn't silently end
+    # automatic enforcement for the rest of the process's life -- which is exactly the
+    # failure mode that made this loop "never really work" in production before.
+    log.error(f"enforce_bans_loop crashed unexpectedly; scheduling a restart: {exc}")
+
+    async def _restart_after_backoff():
+        await asyncio.sleep(60)
+        if not enforce_bans_loop.is_running():
+            log.warning("Restarting enforce_bans_loop after unexpected crash.")
+            enforce_bans_loop.start()
+
+    asyncio.create_task(_restart_after_backoff())
 
 
 def start_loop_if_needed():
