@@ -550,7 +550,7 @@ async def enforce_bans_for_guild(
     # "Already handled" set: local record of IDs this bot has already confirmed
     # banned in this guild, instead of re-fetching Discord's full live ban list.
     try:
-        already_banned_ids: Set[int] = get_enforced_ban_ids(guild.id)
+        already_banned_ids: Set[int] = await asyncio.to_thread(get_enforced_ban_ids, guild.id)
     except Exception as e:
         log.debug(f"Failed to load enforced ban cache for guild {guild.id}: {e}")
         already_banned_ids = set()
@@ -565,7 +565,7 @@ async def enforce_bans_for_guild(
                 if uid not in already_banned_ids:
                     already_banned_ids.add(uid)
                     try:
-                        record_enforced_ban(guild.id, uid)
+                        await asyncio.to_thread(record_enforced_ban, guild.id, uid)
                     except Exception as e:
                         log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
         except Exception as e:
@@ -595,7 +595,7 @@ async def enforce_bans_for_guild(
 
             new_ban_count += 1
             try:
-                record_enforced_ban(guild.id, uid)
+                await asyncio.to_thread(record_enforced_ban, guild.id, uid)
             except Exception as e:
                 log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
 
@@ -623,7 +623,7 @@ async def enforce_bans_for_guild(
                 # re-hitting this same "already banned" error) for that user forever,
                 # every cycle.
                 try:
-                    record_enforced_ban(guild.id, uid)
+                    await asyncio.to_thread(record_enforced_ban, guild.id, uid)
                 except Exception as rec_e:
                     log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {rec_e}")
 
