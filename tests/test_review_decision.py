@@ -192,6 +192,200 @@ class ReportReviewDecisionTests(unittest.IsolatedAsyncioTestCase):
         for item in self.view.children:
             self.assertTrue(item.disabled)
 
+    # ---- reporter DM notification ----
+    # After a decision is durably recorded, the reporter (report["reporter_user_id"])
+    # should be best-effort DMed with the outcome. This must never be able to break the
+    # rest of _handle_decision (the embed/message edit), since many users have DMs closed
+    # to bots -- discord.Forbidden (or fetch_user raising discord.NotFound) here is a
+    # routine, expected outcome, not an error.
+
+    async def test_approve_notifies_reporter_with_approved_dm(self):
+        member = make_member(has_role=True, user_id=555)
+        interaction = make_interaction(member)
+        target_id = 123456789012345678
+        reporter_id = 111
+        report = {
+            "id": 7,
+            "status": "pending",
+            "target_user_id": target_id,
+            "reporter_user_id": reporter_id,
+            "reporter_server_id": 222,
+        }
+        reporter_user = Mock()
+        reporter_user.send = AsyncMock()
+
+        async def fake_fetch_user(uid):
+            # target-user lookup (for the embed) returns None like other tests; the
+            # reporter lookup returns a mock user whose .send() we can assert on.
+            if uid == reporter_id:
+                return reporter_user
+            return None
+
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report", return_value=report), \
+             patch.object(bot, "decide_report", return_value=True), \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock(side_effect=fake_fetch_user)), \
+             patch.object(bot, "_guild_name_for", return_value="Some Server"), \
+             patch.object(bot, "build_report_embed", return_value=Mock()):
+            await self.view._handle_decision(interaction, "approved")
+
+        interaction.message.edit.assert_awaited_once()
+        reporter_user.send.assert_awaited_once()
+        dm_text = reporter_user.send.await_args.args[0]
+        self.assertIn("approved", dm_text)
+        self.assertIn("7", dm_text)
+
+    async def test_reject_notifies_reporter_with_rejected_dm(self):
+        member = make_member(has_role=True, user_id=555)
+        interaction = make_interaction(member)
+        target_id = 123456789012345678
+        reporter_id = 111
+        report = {
+            "id": 7,
+            "status": "pending",
+            "target_user_id": target_id,
+            "reporter_user_id": reporter_id,
+            "reporter_server_id": 222,
+        }
+        reporter_user = Mock()
+        reporter_user.send = AsyncMock()
+
+        async def fake_fetch_user(uid):
+            if uid == reporter_id:
+                return reporter_user
+            return None
+
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report", return_value=report), \
+             patch.object(bot, "decide_report", return_value=True), \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock(side_effect=fake_fetch_user)), \
+             patch.object(bot, "_guild_name_for", return_value="Some Server"), \
+             patch.object(bot, "build_report_embed", return_value=Mock()):
+            await self.view._handle_decision(interaction, "rejected")
+
+        interaction.message.edit.assert_awaited_once()
+        reporter_user.send.assert_awaited_once()
+        dm_text = reporter_user.send.await_args.args[0]
+        self.assertIn("rejected", dm_text)
+        self.assertIn("7", dm_text)
+
+    async def test_dm_forbidden_does_not_break_rest_of_handler(self):
+        # The single most important case: user.send() raising discord.Forbidden (DMs
+        # closed) must be swallowed entirely -- the embed/message edit already happened
+        # before the DM attempt, and no exception should propagate out of
+        # _handle_decision.
+        member = make_member(has_role=True, user_id=555)
+        interaction = make_interaction(member)
+        target_id = 123456789012345678
+        reporter_id = 111
+        report = {
+            "id": 7,
+            "status": "pending",
+            "target_user_id": target_id,
+            "reporter_user_id": reporter_id,
+            "reporter_server_id": 222,
+        }
+        reporter_user = Mock()
+        reporter_user.send = AsyncMock(
+            side_effect=discord.Forbidden(Mock(status=403), "Cannot send messages to this user")
+        )
+
+        async def fake_fetch_user(uid):
+            if uid == reporter_id:
+                return reporter_user
+            return None
+
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report", return_value=report), \
+             patch.object(bot, "decide_report", return_value=True), \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock(side_effect=fake_fetch_user)), \
+             patch.object(bot, "_guild_name_for", return_value="Some Server"), \
+             patch.object(bot, "build_report_embed", return_value=Mock()):
+            # Must not raise.
+            await self.view._handle_decision(interaction, "approved")
+
+        interaction.message.edit.assert_awaited_once()
+        reporter_user.send.assert_awaited_once()
+        for item in self.view.children:
+            self.assertTrue(item.disabled)
+
+    async def test_dm_fetch_user_not_found_does_not_break_rest_of_handler(self):
+        # fetch_user itself can raise (e.g. discord.NotFound) rather than the send call --
+        # that must be equally non-fatal.
+        member = make_member(has_role=True, user_id=555)
+        interaction = make_interaction(member)
+        target_id = 123456789012345678
+        reporter_id = 111
+        report = {
+            "id": 7,
+            "status": "pending",
+            "target_user_id": target_id,
+            "reporter_user_id": reporter_id,
+            "reporter_server_id": 222,
+        }
+
+        async def fake_fetch_user(uid):
+            if uid == reporter_id:
+                raise discord.NotFound(Mock(status=404), "Unknown User")
+            return None
+
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report", return_value=report), \
+             patch.object(bot, "decide_report", return_value=True), \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock(side_effect=fake_fetch_user)), \
+             patch.object(bot, "_guild_name_for", return_value="Some Server"), \
+             patch.object(bot, "build_report_embed", return_value=Mock()):
+            await self.view._handle_decision(interaction, "rejected")
+
+        interaction.message.edit.assert_awaited_once()
+
+    async def test_notification_not_sent_when_decision_loses_the_race(self):
+        # The reporter must only be notified once the decision is actually, durably
+        # committed -- not when this click lost a race to another reviewer (decide_report
+        # returns False and the early-return fires before any DM logic).
+        member = make_member(has_role=True, user_id=555)
+        interaction = make_interaction(member)
+        report = {
+            "id": 7,
+            "status": "pending",
+            "target_user_id": 123456789012345678,
+            "reporter_user_id": 111,
+            "reporter_server_id": 222,
+        }
+        current_after_race = {**report, "status": "rejected"}
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report", side_effect=[report, current_after_race]), \
+             patch.object(bot, "decide_report", return_value=False), \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock()) as mock_fetch_user, \
+             patch.object(bot, "build_report_embed") as mock_build_embed:
+            await self.view._handle_decision(interaction, "approved")
+
+        mock_fetch_user.assert_not_called()
+        mock_build_embed.assert_not_called()
+
+    async def test_notification_not_sent_when_permission_denied(self):
+        member = make_member(has_role=False)
+        interaction = make_interaction(member)
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report") as mock_get_report, \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock()) as mock_fetch_user:
+            await self.view._handle_decision(interaction, "approved")
+
+        mock_get_report.assert_not_called()
+        mock_fetch_user.assert_not_called()
+
+    async def test_notification_not_sent_when_report_not_found(self):
+        member = make_member(has_role=True)
+        interaction = make_interaction(member)
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report", return_value=None), \
+             patch.object(bot, "decide_report") as mock_decide, \
+             patch.object(bot.bot, "fetch_user", new=AsyncMock()) as mock_fetch_user:
+            await self.view._handle_decision(interaction, "approved")
+
+        mock_decide.assert_not_called()
+        mock_fetch_user.assert_not_called()
+
     # ---- race guard: decide_report is the atomic source of truth ----
 
     async def test_decide_report_losing_the_race_sends_already_reviewed_followup(self):

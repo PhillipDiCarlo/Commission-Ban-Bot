@@ -116,6 +116,7 @@ class ReportCmdOffloadTests(unittest.IsolatedAsyncioTestCase):
         with patch("asyncio.to_thread", side_effect=_run_inline) as mock_to_thread, \
              patch.object(bot, "REVIEW_CHANNEL_ID", 111222333), \
              patch.object(bot, "REVIEW_ROLE_ID", 444555666), \
+             patch.object(bot, "count_recent_reports_by_reporter", return_value=0), \
              patch.object(bot, "is_spammer_id", return_value=False) as mock_is_spammer, \
              patch.object(bot, "get_pending_report_for_target", return_value=None), \
              patch.object(bot, "create_report", return_value=42) as mock_create, \

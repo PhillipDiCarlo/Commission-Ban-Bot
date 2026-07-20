@@ -77,6 +77,17 @@ def is_valid_snowflake(value: str) -> bool:
 
 MAX_EVIDENCE_SIZE_BYTES = 8 * 1024 * 1024  # 8 MiB
 
+# /banner history caps the number of report rows rendered as embed fields -- Discord embeds
+# have a hard 25-field limit, so this stays comfortably under that regardless of how much
+# history a given target has accumulated. Older rows beyond the cap are just noted as an
+# omitted count rather than shown.
+HISTORY_DISPLAY_LIMIT = 20
+# get_report_history_for_target's own SQL LIMIT -- a much larger ceiling than
+# HISTORY_DISPLAY_LIMIT, just to bound the query itself for a pathologically
+# over-reported target instead of fetching every row ever, unconditionally, only to
+# discard all but HISTORY_DISPLAY_LIMIT of them in Python.
+HISTORY_QUERY_LIMIT = 200
+
 # Optional: sync slash commands to a single guild instead of globally. Guild-scoped syncs
 # propagate near-instantly (global syncs can take up to ~1hr), so set this during development
 # for fast iteration; leave unset in production for the normal global sync.
@@ -98,6 +109,17 @@ def _parse_float_env(raw: Optional[str], default: float, name: str) -> float:
 # servers. Was hardcoded to 1 hour, which didn't match the actually-intended cadence
 # (once a day / every 12h); now configurable, defaulting to daily.
 ENFORCE_INTERVAL_HOURS = _parse_float_env(os.getenv("ENFORCE_INTERVAL_HOURS"), 24.0, "ENFORCE_INTERVAL_HOURS")
+
+# Rate-limit /banner report submissions per-reporter, so a single admin/mod can't spam the
+# shared review queue. A reporter at or over REPORT_RATE_LIMIT_MAX reports within the last
+# REPORT_RATE_LIMIT_WINDOW_HOURS hours is blocked from submitting another until the window
+# rolls forward. _parse_optional_int_env doesn't take a default param (see REVIEW_CHANNEL_ID
+# / DEV_GUILD_ID above), so the default is applied afterward rather than passed in.
+_REPORT_RATE_LIMIT_MAX_RAW = _parse_optional_int_env(os.getenv("REPORT_RATE_LIMIT_MAX"), "REPORT_RATE_LIMIT_MAX")
+REPORT_RATE_LIMIT_MAX = _REPORT_RATE_LIMIT_MAX_RAW if _REPORT_RATE_LIMIT_MAX_RAW is not None else 5
+REPORT_RATE_LIMIT_WINDOW_HOURS = _parse_float_env(
+    os.getenv("REPORT_RATE_LIMIT_WINDOW_HOURS"), 24.0, "REPORT_RATE_LIMIT_WINDOW_HOURS"
+)
 
 # Intents: do NOT enable privileged members intent
 intents = discord.Intents.none()
@@ -296,6 +318,22 @@ def remove_enforced_ban(server_id: int, discord_id: int):
     finally:
         conn.close()
 
+
+def remove_all_enforced_bans_for_target(discord_id: int):
+    """Bulk/all-guilds counterpart to remove_enforced_ban: wipe every enforced-ban record for
+    discord_id, regardless of server_id. Used by /banner unban so the local cache doesn't keep
+    thinking this id is still enforced anywhere after a global reversal."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.enforced_bans WHERE discord_id = %s;",
+                    (discord_id,),
+                )
+    finally:
+        conn.close()
+
 def get_server_info(server_id: int) -> Optional[dict]:
     conn = get_db_connection()
     try:
@@ -389,6 +427,26 @@ def create_report(target_user_id: int, reporter_user_id: int, reporter_server_id
         conn.close()
 
 
+def count_recent_reports_by_reporter(reporter_user_id: int, window_hours: float) -> int:
+    """Count how many reports reporter_user_id has filed within the last window_hours,
+    used to rate-limit /banner report. Uses Postgres's own time arithmetic (now() -
+    interval) rather than computing a cutoff timestamp in Python, so this stays correct
+    regardless of any clock skew between the app host and the DB host."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM public.reports
+                WHERE reporter_user_id = %s AND created_at > now() - (%s * interval '1 hour');
+                """,
+                (reporter_user_id, window_hours),
+            )
+            return int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
 def set_report_review_message(report_id: int, message_id: int):
     conn = get_db_connection()
     try:
@@ -435,6 +493,28 @@ def get_report(report_id: int) -> Optional[dict]:
             )
             row = cur.fetchone()
             return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_report_history_for_target(target_user_id: int) -> List[dict]:
+    """Every report ever filed against target_user_id (any status), most recent first --
+    unlike get_pending_report_for_target, this isn't limited to the current pending report."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, status, reporter_user_id, reporter_server_id, reviewer_user_id,
+                       created_at, decided_at
+                FROM public.reports
+                WHERE target_user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s;
+                """,
+                (target_user_id, HISTORY_QUERY_LIMIT),
+            )
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -710,18 +790,30 @@ async def enforce_bans_once_global():
         return
 
     try:
-        spammer_ids = await asyncio.to_thread(get_spammer_ids)
+        spammer_id_count = len(await asyncio.to_thread(get_spammer_ids))
     except Exception:
         log.exception("Failed to load spammer ids; skipping this enforcement cycle.")
         return
-    if not spammer_ids:
+    if not spammer_id_count:
         return
 
     log.info(
-        f"Enforcing {len(spammer_ids)} spammer IDs across {len(targets)} enabled+configured servers."
+        f"Enforcing {spammer_id_count} spammer IDs across {len(targets)} enabled+configured servers."
     )
 
-    # Process each guild sequentially, with a small random jitter between them
+    # Process each guild sequentially, with a small random jitter between them. Deliberately
+    # NOT passing a single spammer_ids snapshot down to every guild here (unlike a plain
+    # per-guild call) -- this loop can run for tens of seconds to minutes across many guilds,
+    # and threading one frozen list through all of them used to let a concurrent /banner
+    # unban (which can shrink public.users and wipe enforced_bans mid-loop) get silently
+    # undone: a guild processed later in the loop would still see the just-unbanned id in its
+    # stale snapshot, re-ban it, and re-record it as enforced -- and since that id is gone
+    # from public.users, no future cycle would ever revisit or fix it. Letting each guild's
+    # enforce_bans_for_guild() call fetch its own fresh spammer_ids (by not passing the
+    # parameter) narrows that window from "the whole multi-guild loop's duration" down to
+    # "a single guild's own fetch-then-ban window" -- not a perfect fix (a full fix would need
+    # a cross-table transaction), but proportionate to how rare and narrow the remaining race
+    # is versus the loop-duration-wide window this replaces.
     for server_id, channel_id in targets:
         guild = bot.get_guild(server_id)
         if not guild:
@@ -732,7 +824,7 @@ async def enforce_bans_once_global():
         await asyncio.sleep(jitter)
 
         try:
-            new_count = await enforce_bans_for_guild(guild, channel_id, spammer_ids)
+            new_count = await enforce_bans_for_guild(guild, channel_id)
             log.info(
                 f"Guild {guild.id}: enforcement complete, {new_count} new user(s) added to ban list."
             )
@@ -925,6 +1017,30 @@ class ReportReviewView(discord.ui.View):
             # cosmetic (message doesn't visually update), not a correctness problem.
             log.warning(f"Failed to update report message for report {self.report_id}: {e}")
 
+        # Best-effort: let the original reporter know what happened to their report. Lots
+        # of users have DMs closed to bots without a mutual-server relationship, so
+        # fetch_user raising discord.NotFound, user.send raising discord.Forbidden, or any
+        # other exception here is an expected, routine outcome -- not an error -- and must
+        # never affect the review outcome (already durably recorded above) or the message
+        # edit above, both of which have already happened by this point.
+        try:
+            reporter_id = int(report["reporter_user_id"])
+            reporter = await bot.fetch_user(reporter_id)
+            if decision == "approved":
+                dm_text = (
+                    f"Your spammer report **#{self.report_id}** for <@{target_id}> (`{target_id}`) "
+                    f"has been **approved**. This user has been added to the shared ban list and "
+                    f"will now be enforced across every opted-in server. Thanks for the report."
+                )
+            else:
+                dm_text = (
+                    f"Your spammer report **#{self.report_id}** for <@{target_id}> (`{target_id}`) "
+                    f"has been **rejected** after review. No action will be taken against this user."
+                )
+            await reporter.send(dm_text)
+        except Exception as e:
+            log.debug(f"Could not DM reporter about report {self.report_id} outcome: {e}")
+
 
 def _guild_name_for(server_id: int) -> str:
     guild = bot.get_guild(server_id)
@@ -1113,11 +1229,51 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         )
         return
 
-    if await asyncio.to_thread(is_spammer_id, target_id):
+    # Each of these three checks happens before interaction.response.defer() -- each is
+    # individually wrapped so a transient DB hiccup produces a clean error reply instead
+    # of leaving the interaction to time out with no response at all.
+    try:
+        # Rate-limit per-reporter, checked before the heavier DB lookups below so a
+        # reporter who's already over the limit fails fast and cheaply.
+        recent_count = await asyncio.to_thread(
+            count_recent_reports_by_reporter, interaction.user.id, REPORT_RATE_LIMIT_WINDOW_HOURS
+        )
+    except Exception:
+        log.exception(f"Failed to check report rate limit for reporter {interaction.user.id}")
+        await interaction.response.send_message(
+            "Failed to submit report due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if recent_count >= REPORT_RATE_LIMIT_MAX:
+        await interaction.response.send_message(
+            "You've submitted too many reports recently; please try again later.", ephemeral=True
+        )
+        return
+
+    try:
+        already_banned = await asyncio.to_thread(is_spammer_id, target_id)
+    except Exception:
+        log.exception(f"Failed to check ban-list membership for target {target_id}")
+        await interaction.response.send_message(
+            "Failed to submit report due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if already_banned:
         await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
         return
 
-    if await asyncio.to_thread(get_pending_report_for_target, target_id):
+    try:
+        already_pending = await asyncio.to_thread(get_pending_report_for_target, target_id)
+    except Exception:
+        log.exception(f"Failed to check pending report status for target {target_id}")
+        await interaction.response.send_message(
+            "Failed to submit report due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if already_pending:
         await interaction.response.send_message("That user already has a pending report.", ephemeral=True)
         return
 
@@ -1187,6 +1343,76 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
     await interaction.followup.send(f"Report submitted (#{report_id}) and is awaiting review.", ephemeral=True)
 
 
+@banner_group.command(name="history", description="Show the report history filed against a user ID (review team only).")
+@app_commands.describe(user_id="The numeric Discord user ID to look up")
+async def history_cmd(interaction: discord.Interaction, user_id: str):
+    # Permission here mirrors the review-role gate on the Approve/Reject buttons,
+    # report-cancel, and unban -- not admin_only(). This command surfaces reporter and
+    # reviewer Discord ids, which everywhere else in this bot is treated as
+    # review-team-scoped data (only ever previously visible inside REVIEW_CHANNEL_ID);
+    # admin_only() would let any single opted-in server's admin enumerate that identity
+    # data for any target, which is a broader exposure than intended.
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if REVIEW_ROLE_ID is None or not member or not member.get_role(REVIEW_ROLE_ID):
+        await interaction.response.send_message("You don't have permission to view report history.", ephemeral=True)
+        return
+
+    if not is_valid_snowflake(user_id):
+        await interaction.response.send_message(
+            "That doesn't look like a valid Discord user ID (numbers only). "
+            "Right-click the user and choose \"Copy User ID\" (Developer Mode must be enabled).",
+            ephemeral=True,
+        )
+        return
+
+    target_id = int(user_id)
+
+    try:
+        history = await asyncio.to_thread(get_report_history_for_target, target_id)
+    except Exception:
+        log.exception(f"Failed to fetch report history for target {target_id}")
+        await interaction.response.send_message(
+            "Failed to look up report history due to an internal error.", ephemeral=True
+        )
+        return
+
+    if not history:
+        await interaction.response.send_message(
+            f"No report history found for `{target_id}`.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(title=f"Report History — `{target_id}`", color=discord.Color.blurple())
+
+    shown = history[:HISTORY_DISPLAY_LIMIT]
+    if len(history) > HISTORY_DISPLAY_LIMIT:
+        embed.description = f"Showing the {HISTORY_DISPLAY_LIMIT} most recent of {len(history)} total reports."
+
+    for entry in shown:
+        status = entry.get("status", "unknown")
+        created_at = entry.get("created_at")
+        created_str = discord.utils.format_dt(created_at, style="R") if created_at else "unknown time"
+
+        reporter_line = f"Reported by <@{entry['reporter_user_id']}> from server `{entry['reporter_server_id']}`"
+
+        reviewer_id = entry.get("reviewer_user_id")
+        decided_at = entry.get("decided_at")
+        if reviewer_id and decided_at:
+            review_line = f"Reviewed by <@{reviewer_id}> {discord.utils.format_dt(decided_at, style='R')}"
+        elif status == "pending":
+            review_line = "Still pending review"
+        else:
+            review_line = "Not yet reviewed"
+
+        embed.add_field(
+            name=f"#{entry['id']} — {status} ({created_str})",
+            value=f"{reporter_line}\n{review_line}",
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @banner_group.command(name="report-cancel", description="Cancel a stuck pending report (review team only).")
 @app_commands.describe(report_id="The report ID to cancel")
 async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
@@ -1212,6 +1438,90 @@ async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
     await interaction.response.send_message(
         f"Report #{report_id} cancelled — that user can be reported again.", ephemeral=True
     )
+
+
+@banner_group.command(name="unban", description="Reverse a global ban list decision (review team only).")
+@app_commands.describe(user_id="The numeric Discord user ID to remove from the ban list")
+async def unban_cmd(interaction: discord.Interaction, user_id: str):
+    # Permission here mirrors the review-role gate on the Approve/Reject buttons and
+    # report-cancel, not admin_only() -- undoing a ban-list decision is global (it affects
+    # every opted-in server), so a single server's admin must not be able to unilaterally
+    # reverse it.
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if REVIEW_ROLE_ID is None or not member or not member.get_role(REVIEW_ROLE_ID):
+        await interaction.response.send_message("You don't have permission to manage reports.", ephemeral=True)
+        return
+
+    if not is_valid_snowflake(user_id):
+        await interaction.response.send_message(
+            "That doesn't look like a valid Discord user ID (numbers only). "
+            "Right-click the user and choose \"Copy User ID\" (Developer Mode must be enabled).",
+            ephemeral=True,
+        )
+        return
+
+    target_id = int(user_id)
+
+    try:
+        already_a_spammer = await asyncio.to_thread(is_spammer_id, target_id)
+    except Exception:
+        log.exception(f"Failed to check ban-list membership for {target_id} during unban")
+        await interaction.response.send_message(
+            "Failed to check the ban list due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if not already_a_spammer:
+        await interaction.response.send_message(
+            f"`{target_id}` is not currently on the ban list; nothing to do.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async def _run_unban():
+        try:
+            await asyncio.to_thread(remove_spammer_id, target_id)
+            await asyncio.to_thread(remove_all_enforced_bans_for_target, target_id)
+
+            # Iterate every guild the bot is currently in, not just enabled+configured ones.
+            # A guild could have had enforcement applied while it *was* enabled+configured,
+            # then later been disabled or lost its info channel -- get_enabled_configured_servers()
+            # would silently exclude it here, leaving the live Discord ban in that guild
+            # permanently untouched even though the id is gone from public.users everywhere
+            # else. guild.unban() already degrades gracefully (discord.NotFound) for guilds
+            # where the user was never banned, so it's safe to just attempt it everywhere.
+            unbanned_count = 0
+            attempted_count = 0
+
+            for guild in list(bot.guilds):
+                attempted_count += 1
+                try:
+                    await guild.unban(discord.Object(id=target_id), reason="Removed from commissionSpammer database")
+                    unbanned_count += 1
+                except discord.NotFound:
+                    # Not actually banned in this guild -- nothing to do, not an error.
+                    pass
+                except discord.Forbidden:
+                    log.warning(f"Forbidden from unbanning {target_id} in guild {guild.id}")
+                except Exception:
+                    log.exception(f"Error unbanning {target_id} in guild {guild.id}")
+
+                await asyncio.sleep(0.5)  # avoid rate limit issues, matching enforce_bans_for_guild's pacing
+
+            await interaction.followup.send(
+                f"Removed `{target_id}` from the ban list and unbanned them in "
+                f"{unbanned_count} of {attempted_count} server{'s' if attempted_count != 1 else ''} the bot is in.",
+                ephemeral=True,
+            )
+        except Exception:
+            log.exception(f"Error during unban for target {target_id}")
+            try:
+                await interaction.followup.send("Unban failed due to an internal error.", ephemeral=True)
+            except Exception:
+                pass
+
+    spawn_background_task(_run_unban())
 
 
 async def _check_review_config_health():
