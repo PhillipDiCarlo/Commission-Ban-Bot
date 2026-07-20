@@ -280,6 +280,127 @@ class EnforceBansForGuildTests(unittest.IsolatedAsyncioTestCase):
         mock_remove.assert_called_once_with(target)
         self.mock_record_enforced.assert_not_called()
 
+    # ---- Guard clauses at the top of enforce_bans_for_guild ----
+
+    async def test_guard_clause_returns_zero_when_guild_is_none(self):
+        with patch.object(bot, "get_spammer_ids") as mock_get_spammer_ids:
+            new_count = await bot.enforce_bans_for_guild(None, info_channel_id=999, spammer_ids=[123456789012345678])
+
+        self.assertEqual(new_count, 0)
+        mock_get_spammer_ids.assert_not_called()
+        self.mock_get_enforced.assert_not_called()
+        self.mock_record_enforced.assert_not_called()
+
+    async def test_guard_clause_returns_zero_when_info_channel_id_is_none(self):
+        guild = make_guild()
+        with patch.object(bot, "get_spammer_ids") as mock_get_spammer_ids:
+            new_count = await bot.enforce_bans_for_guild(guild, info_channel_id=None, spammer_ids=[123456789012345678])
+
+        self.assertEqual(new_count, 0)
+        mock_get_spammer_ids.assert_not_called()
+        self.mock_get_enforced.assert_not_called()
+        guild.ban.assert_not_awaited()
+
+    async def test_guard_clause_returns_zero_when_info_channel_id_is_zero(self):
+        # info_channel_id=0 is falsy, same as None -- `if not info_channel_id`.
+        guild = make_guild()
+        with patch.object(bot, "get_spammer_ids") as mock_get_spammer_ids:
+            new_count = await bot.enforce_bans_for_guild(guild, info_channel_id=0, spammer_ids=[123456789012345678])
+
+        self.assertEqual(new_count, 0)
+        mock_get_spammer_ids.assert_not_called()
+        self.mock_get_enforced.assert_not_called()
+        guild.ban.assert_not_awaited()
+
+    async def test_empty_spammer_ids_returns_zero_without_banning(self):
+        # spammer_ids resolves (via the DB fallback, since [] is falsy and falls
+        # through to the get_spammer_ids() branch) to an empty set -> `if not ids`.
+        guild = make_guild()
+        with patch.object(bot, "get_spammer_ids", return_value=[]) as mock_get_spammer_ids:
+            new_count = await bot.enforce_bans_for_guild(guild, info_channel_id=999, spammer_ids=None)
+
+        self.assertEqual(new_count, 0)
+        mock_get_spammer_ids.assert_called_once()
+        guild.ban.assert_not_awaited()
+        # The "no ids at all" guard returns before ever consulting the local
+        # enforced-bans cache.
+        self.mock_get_enforced.assert_not_called()
+
+    # ---- Generic discord.HTTPException branch (not 30035, not 10013) ----
+
+    async def test_generic_http_error_is_caught_logged_and_does_not_abort_the_batch(self):
+        errored_id = 111111111111111111
+        ok_id = 222222222222222222
+        guild = make_guild()
+
+        err = discord.HTTPException(Mock(status=400), "Some other error")
+        err.code = 40001  # arbitrary code that is neither 30035 nor 10013
+
+        async def ban_side_effect(obj, reason=None, delete_message_seconds=None):
+            if obj.id == errored_id:
+                raise err
+            return None
+
+        guild.ban = AsyncMock(side_effect=ban_side_effect)
+        self.mock_get_enforced.return_value = set()
+
+        with patch.object(bot, "remove_spammer_id") as mock_remove_spammer, \
+             patch.object(bot.log, "debug") as mock_log_debug:
+            new_count = await bot.enforce_bans_for_guild(
+                guild, info_channel_id=999, spammer_ids=[errored_id, ok_id]
+            )
+
+        # Both ids attempted -- the generic HTTPException branch does not `break`
+        # (unlike Forbidden), so the loop continues to the next id.
+        self.assertEqual(guild.ban.await_count, 2)
+        self.assertEqual(new_count, 1)
+        # Neither the 30035 backfill nor the 10013 removal branch fired.
+        mock_remove_spammer.assert_not_called()
+        self.mock_record_enforced.assert_called_once_with(guild.id, ok_id)
+        mock_log_debug.assert_called_once()
+
+    # ---- Bare `except Exception` catch-all around the ban attempt ----
+
+    async def test_unexpected_exception_during_ban_is_caught_and_does_not_abort_the_batch(self):
+        bad_id = 111111111111111111
+        ok_id = 222222222222222222
+        guild = make_guild()
+
+        async def ban_side_effect(obj, reason=None, delete_message_seconds=None):
+            if obj.id == bad_id:
+                raise RuntimeError("totally unexpected failure")
+            return None
+
+        guild.ban = AsyncMock(side_effect=ban_side_effect)
+        self.mock_get_enforced.return_value = set()
+
+        # Must not raise out of enforce_bans_for_guild, and must still process ok_id.
+        new_count = await bot.enforce_bans_for_guild(
+            guild, info_channel_id=999, spammer_ids=[bad_id, ok_id]
+        )
+
+        self.assertEqual(guild.ban.await_count, 2)
+        self.assertEqual(new_count, 1)
+        self.mock_record_enforced.assert_called_once_with(guild.id, ok_id)
+
+    # ---- Set-difference logic with more than one id in each bucket ----
+
+    async def test_set_difference_bans_only_the_not_yet_enforced_ids_in_a_mixed_batch(self):
+        already_enforced = 111111111111111111
+        needs_ban_1 = 222222222222222222
+        needs_ban_2 = 333333333333333333
+        guild = make_guild()
+        self.mock_get_enforced.return_value = {already_enforced}
+
+        new_count = await bot.enforce_bans_for_guild(
+            guild, info_channel_id=999, spammer_ids=[already_enforced, needs_ban_1, needs_ban_2]
+        )
+
+        self.assertEqual(new_count, 2)
+        self.assertEqual(guild.ban.await_count, 2)
+        banned_ids = {call.args[0].id for call in guild.ban.await_args_list}
+        self.assertEqual(banned_ids, {needs_ban_1, needs_ban_2})
+
 
 class EnforcedBanDbHelperTests(unittest.TestCase):
     """Lightweight signature/style sanity checks for the new DB helpers -- there's no

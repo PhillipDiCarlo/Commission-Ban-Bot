@@ -14,7 +14,7 @@ Run via (from repo root):
     .venv\\Scripts\\python.exe -m unittest tests.test_enforcement_reliability -v
 """
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot
 
@@ -85,6 +85,59 @@ class EnforceBansOnceGlobalFreshSpammerIdsPerGuildTests(unittest.IsolatedAsyncio
             await bot.enforce_bans_once_global()
 
         mock_enforce.assert_not_called()
+
+
+class EnforceBansOnceGlobalPerGuildErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
+    """The per-guild call inside enforce_bans_once_global's loop is wrapped in its
+    own try/except Exception (bot.py ~826-832), separate from the two top-level DB
+    guards above. Confirms one guild's enforce_bans_for_guild raising doesn't abort
+    the whole multi-guild cycle -- the loop should log and move on to the next
+    target instead."""
+
+    async def test_one_guild_raising_does_not_abort_the_rest_of_the_loop(self):
+        # Mock(id=...), not plain object(): the success path also does
+        # `log.info(f"Guild {guild.id}: ...")` after the call, which needs a
+        # real .id attribute to not itself raise (and get counted as a second
+        # per-guild failure).
+        guild1, guild2 = Mock(id=111), Mock(id=222)
+
+        async def enforce_side_effect(guild, channel_id, *args, **kwargs):
+            if guild is guild1:
+                raise RuntimeError("boom")
+            return 0
+
+        with patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 1), (222, 2)]), \
+             patch.object(bot, "get_spammer_ids", return_value=[999]), \
+             patch.object(bot.bot, "get_guild", side_effect=lambda gid: {111: guild1, 222: guild2}[gid]), \
+             patch.object(bot, "enforce_bans_for_guild", new=AsyncMock(side_effect=enforce_side_effect)) as mock_enforce, \
+             patch.object(bot.log, "exception") as mock_log_exception, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            await bot.enforce_bans_once_global()  # must not raise
+
+        # Both guilds were attempted -- guild1's failure didn't stop guild2's call.
+        self.assertEqual(mock_enforce.await_count, 2)
+        mock_log_exception.assert_called_once()
+
+    async def test_unresolvable_guild_is_skipped_without_aborting_the_rest_of_the_loop(self):
+        # Sibling branch to the one above: `if not guild: continue` (bot.py ~819) --
+        # bot.get_guild(server_id) returns None when the bot is no longer in a guild
+        # that's still enabled+configured in the DB (e.g. it was kicked). That target
+        # should be skipped silently, with no call to enforce_bans_for_guild for it,
+        # and the loop must still proceed to the next (resolvable) guild.
+        guild2 = Mock(id=222)
+
+        with patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 1), (222, 2)]), \
+             patch.object(bot, "get_spammer_ids", return_value=[999]), \
+             patch.object(bot.bot, "get_guild", side_effect=lambda gid: {111: None, 222: guild2}[gid]), \
+             patch.object(bot, "enforce_bans_for_guild", new=AsyncMock(return_value=0)) as mock_enforce, \
+             patch.object(bot.log, "exception") as mock_log_exception, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            await bot.enforce_bans_once_global()  # must not raise
+
+        # Only the resolvable guild was attempted; the unresolvable one was skipped
+        # via `continue`, not treated as an error.
+        mock_enforce.assert_awaited_once_with(guild2, 2)
+        mock_log_exception.assert_not_called()
 
 
 class EnforceBansLoopBodyTests(unittest.IsolatedAsyncioTestCase):

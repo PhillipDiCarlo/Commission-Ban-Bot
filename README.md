@@ -22,10 +22,14 @@ Bot Banner is a Discord bot that uses slash commands only and bans by user ID fr
 ## Project Structure
 ```
 Commission-Ban-Bot/
-├── bot.py               # Main bot (single file)
-├── requirements.txt     # Dependencies (discord.py 2.x)
-├── .env.example         # Template for environment variables
-└── README.md            # This file
+├── bot.py                       # Main bot (single file)
+├── requirements.txt             # Dependencies (discord.py 2.x)
+├── .env.example                 # Template for environment variables
+├── Dockerfile-bot                # Container image (runs as a non-root user)
+├── docker-compose.yml            # Single-service compose file
+├── tests/                       # unittest suite (no live Discord/Postgres needed)
+├── .github/workflows/ci.yml     # CI: py_compile + full test suite on push/PR
+└── README.md                    # This file
 ```
 
 ## Setup
@@ -143,6 +147,13 @@ Notes:
     job can compute what still needs banning without re-downloading each server's entire live
     ban list from Discord every cycle. `/banner sync-now` reconciles this against Discord's
     live ban list (see below); the periodic job trusts it as-is.
+
+## Testing & CI
+- Unit tests live in `tests/` (`python -m unittest discover -s tests -v`). No live Discord or
+  Postgres connection is needed — `tests/__init__.py` sets dummy `DATABASE_URL`/`DISCORD_TOKEN`
+  before importing `bot.py`, and all DB/Discord calls in the suite are mocked.
+- `.github/workflows/ci.yml` runs `python -m py_compile bot.py` and the full test suite on every
+  push to `main` and on every pull request.
 
 ## Troubleshooting
 - Ensure your `DATABASE_URL` includes any required `sslmode` (e.g., `sslmode=require`) if your provider mandates SSL.

@@ -17,10 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the app
-COPY . .
+# Create an unprivileged user to run the app as
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+# Copy the rest of the app, owned by the unprivileged user
+COPY --chown=appuser:appuser . .
 
 # Environment variables are expected from docker-compose/.env:
 # - DISCORD_TOKEN or DISCORD_BOT_TOKEN
 # - DATABASE_URL
+USER appuser
+
 CMD ["python", "bot.py"]
