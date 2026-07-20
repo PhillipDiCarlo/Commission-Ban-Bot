@@ -207,7 +207,14 @@ class OnReadyOffloadTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "enforce_bans_once_global", new=AsyncMock()):
             await bot.on_ready()
 
-            mock_to_thread.assert_any_call(mock_ensure_tables)
+            # ensure_tables is deliberately NOT offloaded (see the comment above its
+            # call site in on_ready): it must run as a direct blocking call so it
+            # monopolizes the event loop for its short, one-time-real duration,
+            # guaranteeing no interaction can be dispatched and hit a table that
+            # doesn't exist yet on a fresh database's very first on_ready.
+            to_thread_calls = [c.args[0] for c in mock_to_thread.call_args_list]
+            self.assertNotIn(mock_ensure_tables, to_thread_calls)
+
             mock_to_thread.assert_any_call(mock_upsert, guild1.id, guild1.owner_id)
             mock_to_thread.assert_any_call(mock_upsert, guild2.id, guild2.owner_id)
             mock_to_thread.assert_any_call(mock_get_pending)

@@ -191,6 +191,62 @@ class EnforceBansForGuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("force_refresh", sig.parameters)
         self.assertEqual(sig.parameters["force_refresh"].default, False)
 
+    async def test_force_refresh_does_not_backfill_non_spammer_bans(self):
+        # Regression test for a real bug found by adversarial review: the original
+        # force_refresh implementation backfilled *every* currently-banned user into
+        # enforced_bans, not just spammer ids. Concretely: a moderator bans someone
+        # for an unrelated reason (raiding), /banner sync-now runs and (with the old
+        # code) would have recorded that unrelated ban into enforced_bans; if that
+        # same user was *later* legitimately approved as a spammer via /banner
+        # report, the stale enforced_bans row would make the bot think they were
+        # already handled in this guild and silently never ban them here -- forever,
+        # with no admin command able to fix it. The fix scopes backfill to `ids`
+        # (the spammer set) only.
+        unrelated_moderator_ban = 999999999999999999  # banned for an unrelated reason, NOT a spammer
+        actual_spammer = 123456789012345678
+        guild = make_guild(live_ban_ids=[unrelated_moderator_ban, actual_spammer])
+        self.mock_get_enforced.return_value = set()
+
+        await bot.enforce_bans_for_guild(
+            guild, info_channel_id=999, spammer_ids=[actual_spammer], force_refresh=True
+        )
+
+        recorded_ids = {call.args[1] for call in self.mock_record_enforced.call_args_list}
+        self.assertIn(actual_spammer, recorded_ids)
+        self.assertNotIn(unrelated_moderator_ban, recorded_ids)
+
+    async def test_force_refresh_prunes_stale_enforced_record_for_manually_unbanned_spammer(self):
+        # The other half of the same fix: if a spammer id was previously recorded as
+        # enforced in this guild but a force_refresh live pull shows they're not
+        # actually banned anymore (a moderator manually unbanned them), the stale
+        # record must be pruned -- otherwise a later re-approval of that same id
+        # would be silently skipped forever, same failure mode as the backfill bug.
+        manually_unbanned_spammer = 123456789012345678
+        guild = make_guild(live_ban_ids=[])  # not actually banned anymore
+        self.mock_get_enforced.return_value = {manually_unbanned_spammer}  # stale local record
+
+        with patch.object(bot, "remove_enforced_ban") as mock_remove_enforced:
+            new_count = await bot.enforce_bans_for_guild(
+                guild, info_channel_id=999, spammer_ids=[manually_unbanned_spammer], force_refresh=True
+            )
+
+        mock_remove_enforced.assert_called_once_with(guild.id, manually_unbanned_spammer)
+        # After pruning, this id is no longer "already handled" -> re-banned this cycle.
+        self.assertEqual(new_count, 1)
+        guild.ban.assert_awaited_once()
+
+    async def test_force_refresh_does_not_prune_ids_still_live_banned(self):
+        target = 123456789012345678
+        guild = make_guild(live_ban_ids=[target])
+        self.mock_get_enforced.return_value = {target}
+
+        with patch.object(bot, "remove_enforced_ban") as mock_remove_enforced:
+            await bot.enforce_bans_for_guild(
+                guild, info_channel_id=999, spammer_ids=[target], force_refresh=True
+            )
+
+        mock_remove_enforced.assert_not_called()
+
     # ---- 30035 "already banned" branch backfills the local record ----
 
     async def test_already_banned_http_error_records_enforced_ban(self):
@@ -282,6 +338,32 @@ class EnforcedBanDbHelperTests(unittest.TestCase):
         sql = fake_cursor.execute.call_args.args[0]
         self.assertIn("INSERT INTO public.enforced_bans", sql)
         self.assertIn("ON CONFLICT", sql)
+        fake_conn.close.assert_called_once()
+
+    def test_remove_enforced_ban_is_callable_with_two_positional_args(self):
+        import inspect
+        self.assertTrue(callable(bot.remove_enforced_ban))
+        sig = inspect.signature(bot.remove_enforced_ban)
+        self.assertEqual(list(sig.parameters), ["server_id", "discord_id"])
+
+    def test_remove_enforced_ban_deletes_and_closes_connection(self):
+        fake_cursor = Mock()
+        fake_cursor.__enter__ = Mock(return_value=fake_cursor)
+        fake_cursor.__exit__ = Mock(return_value=False)
+        fake_cursor.execute = Mock()
+
+        fake_conn = Mock()
+        fake_conn.__enter__ = Mock(return_value=fake_conn)
+        fake_conn.__exit__ = Mock(return_value=False)
+        fake_conn.cursor = Mock(return_value=fake_cursor)
+        fake_conn.close = Mock()
+
+        with patch.object(bot, "get_db_connection", return_value=fake_conn):
+            bot.remove_enforced_ban(999, 123456789012345678)
+
+        fake_cursor.execute.assert_called_once()
+        sql = fake_cursor.execute.call_args.args[0]
+        self.assertIn("DELETE FROM public.enforced_bans", sql)
         fake_conn.close.assert_called_once()
 
 

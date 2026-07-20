@@ -281,6 +281,21 @@ def record_enforced_ban(server_id: int, discord_id: int):
     finally:
         conn.close()
 
+
+def remove_enforced_ban(server_id: int, discord_id: int):
+    """Remove a stale enforced-ban record, e.g. after a force_refresh reconciliation finds
+    discord_id is no longer actually banned in server_id (a moderator manually unbanned them)."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.enforced_bans WHERE server_id = %s AND discord_id = %s;",
+                    (server_id, discord_id),
+                )
+    finally:
+        conn.close()
+
 def get_server_info(server_id: int) -> Optional[dict]:
     conn = get_db_connection()
     try:
@@ -489,6 +504,20 @@ def get_all_pending_reports() -> List[dict]:
 
 
 # -------------------- Utilities --------------------
+# asyncio only holds a *weak* reference to a task created via asyncio.create_task, so a
+# fire-and-forget task with nothing else referencing it can be garbage-collected before
+# it finishes (a well-known asyncio footgun, documented in the stdlib docs). Keeping a
+# strong reference here until the task is done avoids that.
+_background_tasks: set = set()
+
+
+def spawn_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 async def send_info(guild: discord.Guild, channel_id: Optional[int], message: str):
     if not channel_id:
         return
@@ -552,24 +581,46 @@ async def enforce_bans_for_guild(
     try:
         already_banned_ids: Set[int] = await asyncio.to_thread(get_enforced_ban_ids, guild.id)
     except Exception as e:
-        log.debug(f"Failed to load enforced ban cache for guild {guild.id}: {e}")
+        log.warning(f"Failed to load enforced ban cache for guild {guild.id}: {e}")
         already_banned_ids = set()
 
     if force_refresh:
         # Manual reconciliation path (/banner sync-now): pull Discord's live ban list
-        # and backfill anything found there that isn't recorded locally yet (e.g.
-        # banned manually by a moderator, or banned before enforced_bans existed).
+        # and reconcile it against the local record in both directions, scoped to
+        # spammer ids only (`ids`) -- NOT every banned user in the guild:
+        #   - backfill: a spammer id that's live-banned but not yet recorded locally
+        #     (banned manually by a moderator, or banned before enforced_bans existed).
+        #   - prune: a spammer id we thought was enforced but isn't actually banned
+        #     anymore (a moderator manually unbanned them). Without pruning, a stale
+        #     "enforced" row would permanently and silently block ever re-banning that
+        #     id in this guild, even after a later legitimate re-approval of the same
+        #     id via /banner report.
+        # Only ever touching ids in `ids` here is deliberate: backfilling *every*
+        # currently-banned user (not just spammers) would record unrelated moderator
+        # bans (e.g. a raid ban) into enforced_bans, which would then silently mask
+        # that same id if it later, separately, became a real approved spammer.
         try:
+            live_banned_ids: Set[int] = set()
             async for ban_entry in guild.bans(limit=None):
-                uid = ban_entry.user.id
-                if uid not in already_banned_ids:
-                    already_banned_ids.add(uid)
-                    try:
-                        await asyncio.to_thread(record_enforced_ban, guild.id, uid)
-                    except Exception as e:
-                        log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
+                live_banned_ids.add(ban_entry.user.id)
+
+            to_backfill = (live_banned_ids & ids) - already_banned_ids
+            for uid in to_backfill:
+                try:
+                    await asyncio.to_thread(record_enforced_ban, guild.id, uid)
+                except Exception as e:
+                    log.warning(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
+            already_banned_ids |= to_backfill
+
+            stale = (already_banned_ids & ids) - live_banned_ids
+            for uid in stale:
+                try:
+                    await asyncio.to_thread(remove_enforced_ban, guild.id, uid)
+                except Exception as e:
+                    log.warning(f"Failed to prune stale enforced ban for {uid} in guild {guild.id}: {e}")
+            already_banned_ids -= stale
         except Exception as e:
-            log.debug(f"Failed to fetch live ban list in guild {guild.id}: {e}")
+            log.warning(f"Failed to fetch live ban list in guild {guild.id}: {e}")
 
     # Only ban IDs that are NOT already banned/recorded
     to_ban = ids - already_banned_ids
@@ -597,7 +648,7 @@ async def enforce_bans_for_guild(
             try:
                 await asyncio.to_thread(record_enforced_ban, guild.id, uid)
             except Exception as e:
-                log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
+                log.warning(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
 
             await asyncio.sleep(1.0)  # avoid rate limit issues
 
@@ -625,7 +676,7 @@ async def enforce_bans_for_guild(
                 try:
                     await asyncio.to_thread(record_enforced_ban, guild.id, uid)
                 except Exception as rec_e:
-                    log.debug(f"Failed to record enforced ban for {uid} in guild {guild.id}: {rec_e}")
+                    log.warning(f"Failed to record enforced ban for {uid} in guild {guild.id}: {rec_e}")
 
             elif code == 10013:
                 # Unknown User — account deleted or otherwise nonexistent
@@ -720,7 +771,7 @@ async def enforce_bans_loop_error(exc: BaseException):
             log.warning("Restarting enforce_bans_loop after unexpected crash.")
             enforce_bans_loop.start()
 
-    asyncio.create_task(_restart_after_backoff())
+    spawn_background_task(_restart_after_backoff())
 
 
 async def start_loop_if_needed():
@@ -966,7 +1017,7 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
             except Exception:
                 log.exception(f"Error running initial enforcement for guild {guild.id}")
 
-        asyncio.create_task(_run_enforcement())
+        spawn_background_task(_run_enforcement())
 
 
 @banner_group.command(name="status", description="Show current server settings.")
@@ -1024,7 +1075,7 @@ async def sync_now_cmd(interaction: discord.Interaction):
             except:
                 pass
 
-    asyncio.create_task(_run_sync())
+    spawn_background_task(_run_sync())
 
 
 @banner_group.command(name="report", description="Report a user ID as a commission scammer for review.")
@@ -1198,7 +1249,16 @@ async def _check_review_config_health():
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
-    await asyncio.to_thread(ensure_tables)
+    # Deliberately NOT asyncio.to_thread'd, unlike every other DB call in this file.
+    # A blocking call here monopolizes the event loop for its (short, one-time-real)
+    # duration, which is exactly what's wanted: it guarantees no slash command
+    # interaction can be dispatched and hit `public.users`/`public.servers`/etc.
+    # before they exist. Offloading this specific call would let the event loop start
+    # processing other coroutines (including interaction dispatch) while table
+    # creation is still in flight on a worker thread -- a real race only on a fresh
+    # database's very first on_ready, but a bad one (a command hitting a table that
+    # doesn't exist yet, with no app_commands error handler registered to catch it).
+    ensure_tables()
 
     # Ensure we have a row for each guild
     for g in bot.guilds:
