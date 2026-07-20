@@ -77,6 +77,12 @@ def is_valid_snowflake(value: str) -> bool:
 
 MAX_EVIDENCE_SIZE_BYTES = 8 * 1024 * 1024  # 8 MiB
 
+# /banner history caps the number of report rows rendered as embed fields -- Discord embeds
+# have a hard 25-field limit, so this stays comfortably under that regardless of how much
+# history a given target has accumulated. Older rows beyond the cap are just noted as an
+# omitted count rather than shown.
+HISTORY_DISPLAY_LIMIT = 20
+
 # Optional: sync slash commands to a single guild instead of globally. Guild-scoped syncs
 # propagate near-instantly (global syncs can take up to ~1hr), so set this during development
 # for fast iteration; leave unset in production for the normal global sync.
@@ -98,6 +104,17 @@ def _parse_float_env(raw: Optional[str], default: float, name: str) -> float:
 # servers. Was hardcoded to 1 hour, which didn't match the actually-intended cadence
 # (once a day / every 12h); now configurable, defaulting to daily.
 ENFORCE_INTERVAL_HOURS = _parse_float_env(os.getenv("ENFORCE_INTERVAL_HOURS"), 24.0, "ENFORCE_INTERVAL_HOURS")
+
+# Rate-limit /banner report submissions per-reporter, so a single admin/mod can't spam the
+# shared review queue. A reporter at or over REPORT_RATE_LIMIT_MAX reports within the last
+# REPORT_RATE_LIMIT_WINDOW_HOURS hours is blocked from submitting another until the window
+# rolls forward. _parse_optional_int_env doesn't take a default param (see REVIEW_CHANNEL_ID
+# / DEV_GUILD_ID above), so the default is applied afterward rather than passed in.
+_REPORT_RATE_LIMIT_MAX_RAW = _parse_optional_int_env(os.getenv("REPORT_RATE_LIMIT_MAX"), "REPORT_RATE_LIMIT_MAX")
+REPORT_RATE_LIMIT_MAX = _REPORT_RATE_LIMIT_MAX_RAW if _REPORT_RATE_LIMIT_MAX_RAW is not None else 5
+REPORT_RATE_LIMIT_WINDOW_HOURS = _parse_float_env(
+    os.getenv("REPORT_RATE_LIMIT_WINDOW_HOURS"), 24.0, "REPORT_RATE_LIMIT_WINDOW_HOURS"
+)
 
 # Intents: do NOT enable privileged members intent
 intents = discord.Intents.none()
@@ -389,6 +406,26 @@ def create_report(target_user_id: int, reporter_user_id: int, reporter_server_id
         conn.close()
 
 
+def count_recent_reports_by_reporter(reporter_user_id: int, window_hours: float) -> int:
+    """Count how many reports reporter_user_id has filed within the last window_hours,
+    used to rate-limit /banner report. Uses Postgres's own time arithmetic (now() -
+    interval) rather than computing a cutoff timestamp in Python, so this stays correct
+    regardless of any clock skew between the app host and the DB host."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM public.reports
+                WHERE reporter_user_id = %s AND created_at > now() - (%s * interval '1 hour');
+                """,
+                (reporter_user_id, window_hours),
+            )
+            return int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
 def set_report_review_message(report_id: int, message_id: int):
     conn = get_db_connection()
     try:
@@ -435,6 +472,27 @@ def get_report(report_id: int) -> Optional[dict]:
             )
             row = cur.fetchone()
             return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_report_history_for_target(target_user_id: int) -> List[dict]:
+    """Every report ever filed against target_user_id (any status), most recent first --
+    unlike get_pending_report_for_target, this isn't limited to the current pending report."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, status, reporter_user_id, reporter_server_id, reviewer_user_id,
+                       created_at, decided_at
+                FROM public.reports
+                WHERE target_user_id = %s
+                ORDER BY created_at DESC;
+                """,
+                (target_user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -1137,6 +1195,17 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         )
         return
 
+    # Rate-limit per-reporter, checked before any of the heavier DB lookups below so a
+    # reporter who's already over the limit fails fast and cheaply.
+    recent_count = await asyncio.to_thread(
+        count_recent_reports_by_reporter, interaction.user.id, REPORT_RATE_LIMIT_WINDOW_HOURS
+    )
+    if recent_count >= REPORT_RATE_LIMIT_MAX:
+        await interaction.response.send_message(
+            "You've submitted too many reports recently; please try again later.", ephemeral=True
+        )
+        return
+
     if await asyncio.to_thread(is_spammer_id, target_id):
         await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
         return
@@ -1209,6 +1278,66 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         return
 
     await interaction.followup.send(f"Report submitted (#{report_id}) and is awaiting review.", ephemeral=True)
+
+
+@banner_group.command(name="history", description="Show the report history filed against a user ID.")
+@app_commands.describe(user_id="The numeric Discord user ID to look up")
+@admin_only()
+async def history_cmd(interaction: discord.Interaction, user_id: str):
+    if not is_valid_snowflake(user_id):
+        await interaction.response.send_message(
+            "That doesn't look like a valid Discord user ID (numbers only). "
+            "Right-click the user and choose \"Copy User ID\" (Developer Mode must be enabled).",
+            ephemeral=True,
+        )
+        return
+
+    target_id = int(user_id)
+
+    try:
+        history = await asyncio.to_thread(get_report_history_for_target, target_id)
+    except Exception:
+        log.exception(f"Failed to fetch report history for target {target_id}")
+        await interaction.response.send_message(
+            "Failed to look up report history due to an internal error.", ephemeral=True
+        )
+        return
+
+    if not history:
+        await interaction.response.send_message(
+            f"No report history found for `{target_id}`.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(title=f"Report History — `{target_id}`", color=discord.Color.blurple())
+
+    shown = history[:HISTORY_DISPLAY_LIMIT]
+    if len(history) > HISTORY_DISPLAY_LIMIT:
+        embed.description = f"Showing the {HISTORY_DISPLAY_LIMIT} most recent of {len(history)} total reports."
+
+    for entry in shown:
+        status = entry.get("status", "unknown")
+        created_at = entry.get("created_at")
+        created_str = discord.utils.format_dt(created_at, style="R") if created_at else "unknown time"
+
+        reporter_line = f"Reported by <@{entry['reporter_user_id']}> from server `{entry['reporter_server_id']}`"
+
+        reviewer_id = entry.get("reviewer_user_id")
+        decided_at = entry.get("decided_at")
+        if reviewer_id and decided_at:
+            review_line = f"Reviewed by <@{reviewer_id}> {discord.utils.format_dt(decided_at, style='R')}"
+        elif status == "pending":
+            review_line = "Still pending review"
+        else:
+            review_line = "Not yet reviewed"
+
+        embed.add_field(
+            name=f"#{entry['id']} — {status} ({created_str})",
+            value=f"{reporter_line}\n{review_line}",
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @banner_group.command(name="report-cancel", description="Cancel a stuck pending report (review team only).")

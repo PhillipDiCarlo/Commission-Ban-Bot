@@ -136,6 +136,7 @@ class ReportCmdGuardClauseTests(unittest.IsolatedAsyncioTestCase):
         interaction = make_interaction()
         with patch.object(bot, "REVIEW_CHANNEL_ID", REVIEW_CHANNEL_ID), \
              patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "count_recent_reports_by_reporter", return_value=0), \
              patch.object(bot, "is_spammer_id", return_value=True) as mock_is_spammer:
             await bot.report_cmd.callback(interaction, "123456789012345678", make_evidence())
 
@@ -155,6 +156,7 @@ class ReportCmdFullFlowTests(unittest.IsolatedAsyncioTestCase):
         return [
             patch.object(bot, "REVIEW_CHANNEL_ID", REVIEW_CHANNEL_ID),
             patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID),
+            patch.object(bot, "count_recent_reports_by_reporter", return_value=0),
             patch.object(bot, "is_spammer_id", return_value=False),
             patch.object(bot, "get_pending_report_for_target", return_value=None),
             patch.object(bot.bot, "get_channel", return_value=review_channel),
@@ -171,7 +173,7 @@ class ReportCmdFullFlowTests(unittest.IsolatedAsyncioTestCase):
         interaction = make_interaction()
         review_channel = make_review_channel()
         patches = self._common_patches(review_channel)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], \
              patch.object(bot, "create_report", side_effect=psycopg2.IntegrityError("dup")) as mock_create, \
              patch.object(bot, "delete_report") as mock_delete:
             await bot.report_cmd.callback(interaction, "123456789012345678", make_evidence())
@@ -190,7 +192,7 @@ class ReportCmdFullFlowTests(unittest.IsolatedAsyncioTestCase):
         review_channel = make_review_channel()
         review_channel.send = AsyncMock(side_effect=discord.HTTPException(Mock(status=403), "Forbidden"))
         patches = self._common_patches(review_channel)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], \
              patch.object(bot, "create_report", return_value=42) as mock_create, \
              patch.object(bot, "delete_report") as mock_delete, \
              patch.object(bot, "set_report_review_message") as mock_set_msg:
@@ -206,7 +208,7 @@ class ReportCmdFullFlowTests(unittest.IsolatedAsyncioTestCase):
         interaction = make_interaction()
         review_channel = make_review_channel()
         patches = self._common_patches(review_channel)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], \
              patch.object(bot, "create_report", return_value=42) as mock_create, \
              patch.object(bot, "delete_report") as mock_delete, \
              patch.object(bot, "set_report_review_message") as mock_set_msg:
