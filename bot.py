@@ -925,6 +925,30 @@ class ReportReviewView(discord.ui.View):
             # cosmetic (message doesn't visually update), not a correctness problem.
             log.warning(f"Failed to update report message for report {self.report_id}: {e}")
 
+        # Best-effort: let the original reporter know what happened to their report. Lots
+        # of users have DMs closed to bots without a mutual-server relationship, so
+        # fetch_user raising discord.NotFound, user.send raising discord.Forbidden, or any
+        # other exception here is an expected, routine outcome -- not an error -- and must
+        # never affect the review outcome (already durably recorded above) or the message
+        # edit above, both of which have already happened by this point.
+        try:
+            reporter_id = int(report["reporter_user_id"])
+            reporter = await bot.fetch_user(reporter_id)
+            if decision == "approved":
+                dm_text = (
+                    f"Your spammer report **#{self.report_id}** for <@{target_id}> (`{target_id}`) "
+                    f"has been **approved**. This user has been added to the shared ban list and "
+                    f"will now be enforced across every opted-in server. Thanks for the report."
+                )
+            else:
+                dm_text = (
+                    f"Your spammer report **#{self.report_id}** for <@{target_id}> (`{target_id}`) "
+                    f"has been **rejected** after review. No action will be taken against this user."
+                )
+            await reporter.send(dm_text)
+        except Exception as e:
+            log.debug(f"Could not DM reporter about report {self.report_id} outcome: {e}")
+
 
 def _guild_name_for(server_id: int) -> str:
     guild = bot.get_guild(server_id)
