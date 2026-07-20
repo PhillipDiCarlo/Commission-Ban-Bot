@@ -90,7 +90,9 @@ python .\bot.py
 - `/banner set-channel <#channel>` — set the info channel where updates are posted
 - `/banner enable <true|false>` — toggle automatic enforcement for this server
 - `/banner status` — show current settings
-- `/banner sync-now` — trigger a one-time scan for this server
+- `/banner sync-now` — trigger a one-time scan for this server; unlike the periodic background
+  job, this also reconciles against Discord's actual live ban list (catching e.g. manual
+  unbans), not just the bot's local record of who it's already banned
 - `/banner report <user_id> <evidence>` — report a suspected scammer's numeric Discord user ID,
   with a screenshot (image file, max 8 MB) as evidence. Posts to a global review channel (set via
   `REVIEW_CHANNEL_ID`) where anyone holding `REVIEW_ROLE_ID` in that server can Approve (adds the
@@ -117,6 +119,14 @@ Notes:
   - `owner_id BIGINT NOT NULL`
   - `info_channel_id BIGINT` — where updates are posted
   - `enabler BOOLEAN NOT NULL DEFAULT FALSE` — whether enforcement runs for this server
+- `public.reports` — the `/banner report` review queue (pending/approved/rejected); see the
+  `report`/`report-cancel` commands above
+- `public.enforced_bans`
+  - `server_id BIGINT`, `discord_id BIGINT` (composite primary key) — local record of which
+    users this bot has already confirmed banned in which server, so the periodic enforcement
+    job can compute what still needs banning without re-downloading each server's entire live
+    ban list from Discord every cycle. `/banner sync-now` reconciles this against Discord's
+    live ban list (see below); the periodic job trusts it as-is.
 
 ## Troubleshooting
 - Ensure your `DATABASE_URL` includes any required `sslmode` (e.g., `sslmode=require`) if your provider mandates SSL.

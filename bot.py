@@ -4,7 +4,7 @@ import re
 import asyncio
 import logging
 import random
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 
 import discord
 from discord import app_commands
@@ -189,6 +189,19 @@ def ensure_tables():
                     WHERE status = 'pending';
                     """
                 )
+                # Local record of (guild, user) pairs this bot has already confirmed
+                # banned, so enforce_bans_for_guild can diff against this instead of
+                # re-downloading the guild's entire live ban list from Discord every
+                # enforcement cycle (see enforce_bans_for_guild's docstring).
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.enforced_bans (
+                        server_id BIGINT NOT NULL,
+                        discord_id BIGINT NOT NULL,
+                        PRIMARY KEY (server_id, discord_id)
+                    );
+                    """
+                )
     finally:
         conn.close()
 
@@ -231,6 +244,54 @@ def remove_spammer_id(discord_id: int):
                 cur.execute(
                     "DELETE FROM public.users WHERE discord_id = %s;",
                     (discord_id,)
+                )
+    finally:
+        conn.close()
+
+
+def get_enforced_ban_ids(server_id: int) -> Set[int]:
+    """Return the set of discord_ids already recorded as enforced (bot-confirmed banned) for this guild."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT discord_id FROM public.enforced_bans WHERE server_id = %s;",
+                (server_id,),
+            )
+            return {int(r[0]) for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def record_enforced_ban(server_id: int, discord_id: int):
+    """Record that discord_id has been confirmed banned in server_id, so future enforcement
+    cycles skip it without needing to re-check Discord's live ban list."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.enforced_bans (server_id, discord_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING;
+                    """,
+                    (server_id, discord_id),
+                )
+    finally:
+        conn.close()
+
+
+def remove_enforced_ban(server_id: int, discord_id: int):
+    """Remove a stale enforced-ban record, e.g. after a force_refresh reconciliation finds
+    discord_id is no longer actually banned in server_id (a moderator manually unbanned them)."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.enforced_bans WHERE server_id = %s AND discord_id = %s;",
+                    (server_id, discord_id),
                 )
     finally:
         conn.close()
@@ -443,6 +504,20 @@ def get_all_pending_reports() -> List[dict]:
 
 
 # -------------------- Utilities --------------------
+# asyncio only holds a *weak* reference to a task created via asyncio.create_task, so a
+# fire-and-forget task with nothing else referencing it can be garbage-collected before
+# it finishes (a well-known asyncio footgun, documented in the stdlib docs). Keeping a
+# strong reference here until the task is done avoids that.
+_background_tasks: set = set()
+
+
+def spawn_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 async def send_info(guild: discord.Guild, channel_id: Optional[int], message: str):
     if not channel_id:
         return
@@ -464,29 +539,90 @@ async def enforce_bans_for_guild(
     guild: discord.Guild,
     info_channel_id: int,
     spammer_ids: Optional[List[int]] = None,
+    force_refresh: bool = False,
 ) -> int:
     """
     Enforce bans for a single guild.
     Returns the number of *new* users added to the guild's ban list.
+
+    "Already handled" set — normal path vs. force_refresh:
+    Rather than recomputing the diff against Discord's live ban list every cycle (a
+    fully paginated guild.bans(limit=None) call that re-downloads the *entire* ban
+    list purely to compute a set difference that usually changes by a handful of IDs
+    cycle over cycle — expensive and slow for large lists, which is the whole point
+    of this bot), the normal automatic path diffs against a local Postgres record
+    (public.enforced_bans) of (guild, user) pairs this bot has already confirmed
+    banned. That's populated as bans succeed (and via the 30035 "already banned"
+    branch below), so it stays in sync without ever needing to re-fetch Discord's
+    live list.
+
+    Trade-off: if a moderator manually *unbans* someone through Discord's own UI, the
+    local record still says "banned", so the normal automatic path won't notice or
+    re-ban them. That's accepted as the cost of the routine cycle. For cases that
+    need Discord's live truth (e.g. reconciling after manual unbans, or catching up
+    on bans that happened before this table existed), pass force_refresh=True — used
+    by the manual /banner sync-now command — which still pulls the live ban list and
+    backfills anything found there into enforced_bans before computing the diff.
     """
     if not guild or not info_channel_id:
         return 0
 
     # All spammer IDs from DB (or override if provided)
-    ids = set(spammer_ids or get_spammer_ids())
+    if spammer_ids:
+        ids = set(spammer_ids)
+    else:
+        ids = set(await asyncio.to_thread(get_spammer_ids))
     if not ids:
         log.debug(f"No spammer IDs found for guild {guild.id}. Nothing to ban.")
         return 0
 
-    # Fetch current bans from Discord
-    already_banned_ids: set[int] = set()
+    # "Already handled" set: local record of IDs this bot has already confirmed
+    # banned in this guild, instead of re-fetching Discord's full live ban list.
     try:
-        async for ban_entry in guild.bans(limit=None):
-            already_banned_ids.add(ban_entry.user.id)
+        already_banned_ids: Set[int] = await asyncio.to_thread(get_enforced_ban_ids, guild.id)
     except Exception as e:
-        log.debug(f"Failed to fetch ban list in guild {guild.id}: {e}")
+        log.warning(f"Failed to load enforced ban cache for guild {guild.id}: {e}")
+        already_banned_ids = set()
 
-    # Only ban IDs that are NOT already banned
+    if force_refresh:
+        # Manual reconciliation path (/banner sync-now): pull Discord's live ban list
+        # and reconcile it against the local record in both directions, scoped to
+        # spammer ids only (`ids`) -- NOT every banned user in the guild:
+        #   - backfill: a spammer id that's live-banned but not yet recorded locally
+        #     (banned manually by a moderator, or banned before enforced_bans existed).
+        #   - prune: a spammer id we thought was enforced but isn't actually banned
+        #     anymore (a moderator manually unbanned them). Without pruning, a stale
+        #     "enforced" row would permanently and silently block ever re-banning that
+        #     id in this guild, even after a later legitimate re-approval of the same
+        #     id via /banner report.
+        # Only ever touching ids in `ids` here is deliberate: backfilling *every*
+        # currently-banned user (not just spammers) would record unrelated moderator
+        # bans (e.g. a raid ban) into enforced_bans, which would then silently mask
+        # that same id if it later, separately, became a real approved spammer.
+        try:
+            live_banned_ids: Set[int] = set()
+            async for ban_entry in guild.bans(limit=None):
+                live_banned_ids.add(ban_entry.user.id)
+
+            to_backfill = (live_banned_ids & ids) - already_banned_ids
+            for uid in to_backfill:
+                try:
+                    await asyncio.to_thread(record_enforced_ban, guild.id, uid)
+                except Exception as e:
+                    log.warning(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
+            already_banned_ids |= to_backfill
+
+            stale = (already_banned_ids & ids) - live_banned_ids
+            for uid in stale:
+                try:
+                    await asyncio.to_thread(remove_enforced_ban, guild.id, uid)
+                except Exception as e:
+                    log.warning(f"Failed to prune stale enforced ban for {uid} in guild {guild.id}: {e}")
+            already_banned_ids -= stale
+        except Exception as e:
+            log.warning(f"Failed to fetch live ban list in guild {guild.id}: {e}")
+
+    # Only ban IDs that are NOT already banned/recorded
     to_ban = ids - already_banned_ids
     if not to_ban:
         log.debug(f"No new bans needed for guild {guild.id}.")
@@ -509,6 +645,10 @@ async def enforce_bans_for_guild(
             )
 
             new_ban_count += 1
+            try:
+                await asyncio.to_thread(record_enforced_ban, guild.id, uid)
+            except Exception as e:
+                log.warning(f"Failed to record enforced ban for {uid} in guild {guild.id}: {e}")
 
             await asyncio.sleep(1.0)  # avoid rate limit issues
 
@@ -526,19 +666,28 @@ async def enforce_bans_for_guild(
             code = getattr(e, "code", None)
 
             if code == 30035:
-                # Already banned (Discord duplication)
-                pass
+                # Already banned (Discord duplication). Since the normal path no longer
+                # pre-checks Discord's live ban list, this is now the only way a user
+                # who was already banned by some other means (manually by a moderator,
+                # or before enforced_bans existed) gets backfilled into the local
+                # record -- without this, the bot would keep re-attempting (and
+                # re-hitting this same "already banned" error) for that user forever,
+                # every cycle.
+                try:
+                    await asyncio.to_thread(record_enforced_ban, guild.id, uid)
+                except Exception as rec_e:
+                    log.warning(f"Failed to record enforced ban for {uid} in guild {guild.id}: {rec_e}")
 
             elif code == 10013:
                 # Unknown User — account deleted or otherwise nonexistent
                 log.info(f"User {uid} no longer exists on Discord. Removing from database.")
-                remove_spammer_id(uid)
+                await asyncio.to_thread(remove_spammer_id, uid)
 
             else:
                 log.debug(f"HTTP error banning {uid} in guild {guild.id}: {e}")
 
             await asyncio.sleep(0.2)
-    
+
         except Exception as e:
             log.debug(f"Unexpected error banning {uid} in guild {guild.id}: {e}")
             await asyncio.sleep(0.2)
@@ -553,7 +702,7 @@ async def enforce_bans_once_global():
     # otherwise still looking healthy. Catching here means a bad cycle just gets skipped
     # and retried next time instead.
     try:
-        targets = get_enabled_configured_servers()
+        targets = await asyncio.to_thread(get_enabled_configured_servers)
     except Exception:
         log.exception("Failed to load enabled/configured servers; skipping this enforcement cycle.")
         return
@@ -561,7 +710,7 @@ async def enforce_bans_once_global():
         return
 
     try:
-        spammer_ids = get_spammer_ids()
+        spammer_ids = await asyncio.to_thread(get_spammer_ids)
     except Exception:
         log.exception("Failed to load spammer ids; skipping this enforcement cycle.")
         return
@@ -622,12 +771,12 @@ async def enforce_bans_loop_error(exc: BaseException):
             log.warning("Restarting enforce_bans_loop after unexpected crash.")
             enforce_bans_loop.start()
 
-    asyncio.create_task(_restart_after_backoff())
+    spawn_background_task(_restart_after_backoff())
 
 
-def start_loop_if_needed():
+async def start_loop_if_needed():
     # Start loop only if there's at least one enabled+configured server
-    if get_enabled_configured_servers() and not enforce_bans_loop.is_running():
+    if await asyncio.to_thread(get_enabled_configured_servers) and not enforce_bans_loop.is_running():
         enforce_bans_loop.start()
 
 
@@ -704,7 +853,7 @@ class ReportReviewView(discord.ui.View):
             await interaction.response.send_message("You don't have permission to review reports.", ephemeral=True)
             return
 
-        report = get_report(self.report_id)
+        report = await asyncio.to_thread(get_report, self.report_id)
         if not report:
             await interaction.response.send_message("This report no longer exists.", ephemeral=True)
             return
@@ -725,7 +874,7 @@ class ReportReviewView(discord.ui.View):
             # two reviewers racing (or a click landing after someone else already decided)
             # can never desync the displayed status from whether the user actually got
             # banned.
-            won = decide_report(self.report_id, decision, interaction.user.id)
+            won = await asyncio.to_thread(decide_report, self.report_id, decision, interaction.user.id)
         except Exception:
             log.exception(f"Failed to record decision for report {self.report_id}")
             try:
@@ -738,7 +887,7 @@ class ReportReviewView(discord.ui.View):
             return
 
         if not won:
-            current = get_report(self.report_id)
+            current = await asyncio.to_thread(get_report, self.report_id)
             status = current["status"] if current else "unknown"
             await interaction.followup.send(
                 f"Already reviewed by someone else (status: {status}).", ephemeral=True
@@ -810,17 +959,17 @@ async def set_channel_cmd(interaction: discord.Interaction, channel: discord.Tex
         return
 
     # Read existing before update to detect first-time setup
-    info_before = get_server_info(guild.id)
-    upsert_server(guild.id, guild.owner_id)  # ensure row exists
-    set_info_channel(guild.id, channel.id)
+    info_before = await asyncio.to_thread(get_server_info, guild.id)
+    await asyncio.to_thread(upsert_server, guild.id, guild.owner_id)  # ensure row exists
+    await asyncio.to_thread(set_info_channel, guild.id, channel.id)
     await interaction.response.send_message(f"Info channel set to #{channel.name}.", ephemeral=True)
 
     # If first time and enabled, run enforcement for this guild only
-    info_after = get_server_info(guild.id)
+    info_after = await asyncio.to_thread(get_server_info, guild.id)
     if (not info_before or not info_before.get("info_channel_id")) and info_after and info_after.get("enabler"):
         await enforce_bans_for_guild(guild, channel.id)
     # Start background loop if needed
-    start_loop_if_needed()
+    await start_loop_if_needed()
 
 
 @banner_group.command(name="enable", description="Enable or disable automatic banning.")
@@ -838,11 +987,11 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
     except Exception:
         pass
 
-    # Update DB (still blocking, but very fast in practice)
-    upsert_server(guild.id, guild.owner_id)
-    set_enabler(guild.id, enabled)
+    # Update DB (offloaded to a worker thread so it doesn't stall the event loop)
+    await asyncio.to_thread(upsert_server, guild.id, guild.owner_id)
+    await asyncio.to_thread(set_enabler, guild.id, enabled)
 
-    info = get_server_info(guild.id)
+    info = await asyncio.to_thread(get_server_info, guild.id)
     note = ""
     run_now = False
     if enabled and info and info.get("info_channel_id"):
@@ -864,11 +1013,11 @@ async def enable_cmd(interaction: discord.Interaction, enabled: bool):
         async def _run_enforcement():
             try:
                 await enforce_bans_for_guild(guild, info["info_channel_id"])
-                start_loop_if_needed()
+                await start_loop_if_needed()
             except Exception:
                 log.exception(f"Error running initial enforcement for guild {guild.id}")
 
-        asyncio.create_task(_run_enforcement())
+        spawn_background_task(_run_enforcement())
 
 
 @banner_group.command(name="status", description="Show current server settings.")
@@ -878,7 +1027,7 @@ async def status_cmd(interaction: discord.Interaction):
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
-    info = get_server_info(guild.id)
+    info = await asyncio.to_thread(get_server_info, guild.id)
     if not info:
         await interaction.response.send_message("No settings found. Use /banner set-channel and /banner enable.", ephemeral=True)
         return
@@ -897,7 +1046,7 @@ async def sync_now_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
 
-    info = get_server_info(guild.id)
+    info = await asyncio.to_thread(get_server_info, guild.id)
     if not info or not info.get("info_channel_id"):
         await interaction.response.send_message(
             "Info channel is not set yet. Use /banner set-channel first.",
@@ -909,7 +1058,12 @@ async def sync_now_cmd(interaction: discord.Interaction):
 
     async def _run_sync():
         try:
-            new_count = await enforce_bans_for_guild(guild, info["info_channel_id"])
+            # force_refresh=True: this is the manual "make sure everything's actually
+            # in sync right now" escape hatch -- unlike the automatic cycle, it's fine
+            # (expected, even) for this to pay the cost of re-checking Discord's live
+            # ban list, since it also catches manual unbans / out-of-band bans that the
+            # cheaper local-cache diff used elsewhere can't see.
+            new_count = await enforce_bans_for_guild(guild, info["info_channel_id"], force_refresh=True)
             await interaction.followup.send(
                 f"Sync complete. **{new_count} new user{'s' if new_count != 1 else ''}** added to the ban list.",
                 ephemeral=True
@@ -921,7 +1075,7 @@ async def sync_now_cmd(interaction: discord.Interaction):
             except:
                 pass
 
-    asyncio.create_task(_run_sync())
+    spawn_background_task(_run_sync())
 
 
 @banner_group.command(name="report", description="Report a user ID as a commission scammer for review.")
@@ -959,11 +1113,11 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         )
         return
 
-    if is_spammer_id(target_id):
+    if await asyncio.to_thread(is_spammer_id, target_id):
         await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
         return
 
-    if get_pending_report_for_target(target_id):
+    if await asyncio.to_thread(get_pending_report_for_target, target_id):
         await interaction.response.send_message("That user already has a pending report.", ephemeral=True)
         return
 
@@ -987,7 +1141,7 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         target_user = None
 
     try:
-        report_id = create_report(target_id, interaction.user.id, guild.id)
+        report_id = await asyncio.to_thread(create_report, target_id, interaction.user.id, guild.id)
     except psycopg2.IntegrityError:
         # The one-pending-report-per-target unique index caught a race that the earlier
         # get_pending_report_for_target check missed (two reports for the same target
@@ -1020,11 +1174,11 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         view = ReportReviewView(report_id)
 
         message = await review_channel.send(embed=embed, file=discord_file, view=view)
-        set_report_review_message(report_id, message.id)
+        await asyncio.to_thread(set_report_review_message, report_id, message.id)
     except Exception:
         log.exception(f"Failed to post report {report_id} to review channel; removing orphaned report row")
         try:
-            delete_report(report_id)
+            await asyncio.to_thread(delete_report, report_id)
         except Exception:
             log.exception(f"Failed to clean up orphaned report {report_id}")
         await interaction.followup.send("Failed to submit report due to an internal error. Please try again.", ephemeral=True)
@@ -1044,7 +1198,7 @@ async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
         await interaction.response.send_message("You don't have permission to manage reports.", ephemeral=True)
         return
 
-    report = get_report(report_id)
+    report = await asyncio.to_thread(get_report, report_id)
     if not report:
         await interaction.response.send_message(f"No report with id #{report_id}.", ephemeral=True)
         return
@@ -1054,7 +1208,7 @@ async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
         )
         return
 
-    delete_report(report_id)
+    await asyncio.to_thread(delete_report, report_id)
     await interaction.response.send_message(
         f"Report #{report_id} cancelled — that user can be reported again.", ephemeral=True
     )
@@ -1095,30 +1249,40 @@ async def _check_review_config_health():
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
+    # Deliberately NOT asyncio.to_thread'd, unlike every other DB call in this file.
+    # A blocking call here monopolizes the event loop for its (short, one-time-real)
+    # duration, which is exactly what's wanted: it guarantees no slash command
+    # interaction can be dispatched and hit `public.users`/`public.servers`/etc.
+    # before they exist. Offloading this specific call would let the event loop start
+    # processing other coroutines (including interaction dispatch) while table
+    # creation is still in flight on a worker thread -- a real race only on a fresh
+    # database's very first on_ready, but a bad one (a command hitting a table that
+    # doesn't exist yet, with no app_commands error handler registered to catch it).
     ensure_tables()
 
     # Ensure we have a row for each guild
     for g in bot.guilds:
-        upsert_server(g.id, g.owner_id)
+        await asyncio.to_thread(upsert_server, g.id, g.owner_id)
 
     # Re-attach persistent Approve/Reject views for any reports still awaiting review,
     # otherwise their buttons stop working after this restart.
-    for report in get_all_pending_reports():
+    pending_reports = await asyncio.to_thread(get_all_pending_reports)
+    for report in pending_reports:
         bot.add_view(ReportReviewView(report["id"]), message_id=report["review_message_id"])
 
     await _check_review_config_health()
 
     # Run once globally (only for enabled+configured servers), then start loop if needed
     await enforce_bans_once_global()
-    start_loop_if_needed()
+    await start_loop_if_needed()
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     # Bot added to a new server
-    upsert_server(guild.id, guild.owner_id)
+    await asyncio.to_thread(upsert_server, guild.id, guild.owner_id)
     # Do not enforce until channel is set and enabled
-    start_loop_if_needed()
+    await start_loop_if_needed()
 
 
 # -------------------- Entry --------------------
