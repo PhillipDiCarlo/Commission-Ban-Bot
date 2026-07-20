@@ -14,7 +14,7 @@ Run via (from repo root):
     .venv\\Scripts\\python.exe -m unittest tests.test_enforcement_reliability -v
 """
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import bot
 
@@ -43,6 +43,48 @@ class EnforceBansOnceGlobalReliabilityTests(unittest.IsolatedAsyncioTestCase):
             await bot.enforce_bans_once_global()
 
         mock_get_spammer_ids.assert_not_called()
+
+
+class EnforceBansOnceGlobalFreshSpammerIdsPerGuildTests(unittest.IsolatedAsyncioTestCase):
+    """Regression test for a CRITICAL bug found by adversarial review: enforce_bans_once_global
+    used to fetch spammer_ids *once* and thread that single frozen snapshot through its entire
+    sequential, jittered loop over every enabled+configured guild (which can run for tens of
+    seconds to minutes across many guilds). If a spammer id was removed mid-loop (e.g. via
+    /banner unban, which also wipes that id's enforced_bans rows across every guild), a guild
+    processed later in the loop would still see the stale id in its snapshot, re-ban it, and
+    re-record it as enforced -- and since the id is gone from public.users, no future cycle
+    would ever revisit or fix it, making the re-ban silently permanent. The fix: don't pass a
+    spammer_ids override down to enforce_bans_for_guild from this loop at all, so each guild
+    fetches its own fresh copy right before it's processed."""
+
+    async def test_enforce_bans_for_guild_is_called_without_a_spammer_ids_override(self):
+        guild1, guild2 = object(), object()
+        with patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 1), (222, 2)]), \
+             patch.object(bot, "get_spammer_ids", return_value=[999]), \
+             patch.object(bot.bot, "get_guild", side_effect=lambda gid: {111: guild1, 222: guild2}[gid]), \
+             patch.object(bot, "enforce_bans_for_guild", new=AsyncMock(return_value=0)) as mock_enforce, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            await bot.enforce_bans_once_global()
+
+        self.assertEqual(mock_enforce.await_count, 2)
+        for call in mock_enforce.await_args_list:
+            # Exactly (guild, channel_id) -- no spammer_ids passed, positionally or by
+            # keyword, so each call falls through to enforce_bans_for_guild's own
+            # default (a fresh await asyncio.to_thread(get_spammer_ids) per guild).
+            self.assertEqual(len(call.args), 2)
+            self.assertNotIn("spammer_ids", call.kwargs)
+
+    async def test_early_exit_check_still_uses_a_count_not_a_reused_list(self):
+        # The early "is there anything to enforce at all" check still needs *a* fetch of
+        # spammer_ids, but that value must never be threaded down into the per-guild
+        # calls (covered above) -- this just confirms the early-exit path still works
+        # when there are zero spammer ids.
+        with patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 1)]), \
+             patch.object(bot, "get_spammer_ids", return_value=[]), \
+             patch.object(bot, "enforce_bans_for_guild", new=AsyncMock()) as mock_enforce:
+            await bot.enforce_bans_once_global()
+
+        mock_enforce.assert_not_called()
 
 
 class EnforceBansLoopBodyTests(unittest.IsolatedAsyncioTestCase):

@@ -41,6 +41,23 @@ def make_interaction():
     return interaction
 
 
+def make_member(has_role: bool, user_id: int = 999):
+    """Member-spec'd mock so isinstance(user, discord.Member) is True -- the pattern
+    history_cmd, report_cancel_cmd, and unban_cmd all use for their REVIEW_ROLE_ID gate."""
+    member = Mock(spec=discord.Member)
+    member.id = user_id
+    member.get_role = Mock(return_value=Mock() if has_role else None)
+    return member
+
+
+def make_reviewer_interaction():
+    """An interaction from a member holding the review role -- history_cmd is gated
+    the same way as report_cancel_cmd/unban_cmd, not admin_only()."""
+    interaction = make_interaction()
+    interaction.user = make_member(has_role=True)
+    return interaction
+
+
 def make_evidence(content_type="image/png", size=1024, filename="proof.png"):
     evidence = Mock(spec=discord.Attachment)
     evidence.content_type = content_type
@@ -101,8 +118,11 @@ class ReportHistoryAndRateLimitDbHelperTests(unittest.TestCase):
         self.assertIn("public.reports", sql)
         self.assertIn("target_user_id", sql)
         self.assertIn("ORDER BY created_at DESC", sql)
+        self.assertIn("LIMIT", sql)
         params = fake_cursor.execute.call_args.args[1]
-        self.assertEqual(params, (123456789012345678,))
+        # Bounds the query itself (a much larger ceiling than the display cap) so a
+        # pathologically over-reported target can't force an unbounded fetch.
+        self.assertEqual(params, (123456789012345678, bot.HISTORY_QUERY_LIMIT))
         fake_conn.close.assert_called_once()
 
     def test_get_report_history_for_target_empty_returns_empty_list(self):
@@ -168,9 +188,53 @@ class ReportHistoryAndRateLimitDbHelperTests(unittest.TestCase):
 
 # -------------------- /banner history command tests --------------------
 class HistoryCmdTests(unittest.IsolatedAsyncioTestCase):
-    async def test_invalid_user_id_rejected_before_any_db_call(self):
+    # ---- permission gate: review-role only, not admin_only() ----
+    # history_cmd surfaces reporter/reviewer Discord ids, which everywhere else in this
+    # bot is review-team-scoped data -- these tests were added when the gate was fixed
+    # from @admin_only() to match report_cancel_cmd/unban_cmd's inline REVIEW_ROLE_ID
+    # check (an adversarial-review finding: admin_only() let any opted-in server's admin
+    # enumerate that identity data, broader exposure than intended).
+
+    async def test_non_member_denied(self):
+        interaction = make_interaction()  # plain Mock, not Member-spec'd
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target") as mock_history:
+            await bot.history_cmd.callback(interaction, "123456789012345678")
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "You don't have permission to view report history.", ephemeral=True
+        )
+        mock_history.assert_not_called()
+
+    async def test_member_without_role_denied(self):
         interaction = make_interaction()
-        with patch.object(bot, "get_report_history_for_target") as mock_history:
+        interaction.user = make_member(has_role=False)
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target") as mock_history:
+            await bot.history_cmd.callback(interaction, "123456789012345678")
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "You don't have permission to view report history.", ephemeral=True
+        )
+        mock_history.assert_not_called()
+
+    async def test_review_role_id_unconfigured_denies_even_a_role_holding_member(self):
+        interaction = make_reviewer_interaction()
+        with patch.object(bot, "REVIEW_ROLE_ID", None), \
+             patch.object(bot, "get_report_history_for_target") as mock_history:
+            await bot.history_cmd.callback(interaction, "123456789012345678")
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "You don't have permission to view report history.", ephemeral=True
+        )
+        mock_history.assert_not_called()
+
+    # ---- actual command behavior (permission granted) ----
+
+    async def test_invalid_user_id_rejected_before_any_db_call(self):
+        interaction = make_reviewer_interaction()
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target") as mock_history:
             await bot.history_cmd.callback(interaction, "not-a-real-id")
 
         interaction.response.send_message.assert_awaited_once()
@@ -178,8 +242,9 @@ class HistoryCmdTests(unittest.IsolatedAsyncioTestCase):
         mock_history.assert_not_called()
 
     async def test_no_history_says_so_clearly(self):
-        interaction = make_interaction()
-        with patch.object(bot, "get_report_history_for_target", return_value=[]) as mock_history:
+        interaction = make_reviewer_interaction()
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target", return_value=[]) as mock_history:
             await bot.history_cmd.callback(interaction, "123456789012345678")
 
         mock_history.assert_called_once_with(123456789012345678)
@@ -189,7 +254,7 @@ class HistoryCmdTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kwargs.kwargs.get("ephemeral"))
 
     async def test_history_present_renders_embed_with_one_field_per_report(self):
-        interaction = make_interaction()
+        interaction = make_reviewer_interaction()
         rows = [
             make_report_row(3, "pending"),
             make_report_row(2, "approved", reviewer_user_id=777,
@@ -197,7 +262,8 @@ class HistoryCmdTests(unittest.IsolatedAsyncioTestCase):
             make_report_row(1, "rejected", reviewer_user_id=778,
                              decided_at=datetime(2026, 1, 3, tzinfo=timezone.utc)),
         ]
-        with patch.object(bot, "get_report_history_for_target", return_value=rows):
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target", return_value=rows):
             await bot.history_cmd.callback(interaction, "123456789012345678")
 
         interaction.response.send_message.assert_awaited_once()
@@ -222,8 +288,9 @@ class HistoryCmdTests(unittest.IsolatedAsyncioTestCase):
         rows = [make_report_row(i, "approved", reviewer_user_id=1,
                                  decided_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
                 for i in range(bot.HISTORY_DISPLAY_LIMIT + 10)]
-        interaction = make_interaction()
-        with patch.object(bot, "get_report_history_for_target", return_value=rows):
+        interaction = make_reviewer_interaction()
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target", return_value=rows):
             await bot.history_cmd.callback(interaction, "123456789012345678")
 
         call_kwargs = interaction.response.send_message.call_args.kwargs
@@ -234,8 +301,9 @@ class HistoryCmdTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(len(rows)), embed.description)
 
     async def test_db_failure_is_caught_and_reported_not_raised(self):
-        interaction = make_interaction()
-        with patch.object(bot, "get_report_history_for_target", side_effect=RuntimeError("db exploded")):
+        interaction = make_reviewer_interaction()
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "get_report_history_for_target", side_effect=RuntimeError("db exploded")):
             await bot.history_cmd.callback(interaction, "123456789012345678")  # must not raise
 
         interaction.response.send_message.assert_awaited_once()

@@ -61,6 +61,11 @@ DISCORD_TOKEN=your_discord_bot_token
 # Optional, required only for /banner report:
 # REVIEW_CHANNEL_ID=123456789012345678   # channel where reports are posted for review
 # REVIEW_ROLE_ID=123456789012345678      # role (in that channel's server) allowed to approve/reject
+
+# Optional: per-reporter rate limit on /banner report submissions. Defaults to 5 reports
+# per reporter per 24 hours.
+# REPORT_RATE_LIMIT_MAX=5
+# REPORT_RATE_LIMIT_WINDOW_HOURS=24
 ```
 
 A ready-to-copy template lives at `.env.example`.
@@ -102,6 +107,17 @@ python .\bot.py
 - `/banner report-cancel <report_id>` — cancel a stuck pending report (e.g. its review message
   was deleted). Restricted to members holding `REVIEW_ROLE_ID`, same as the Approve/Reject
   buttons.
+- `/banner history <user_id>` — show every report ever filed against a user ID (not just the
+  current pending one), with status, reporter, and reviewer. Restricted to `REVIEW_ROLE_ID`
+  holders, same as the buttons and `report-cancel`.
+- `/banner unban <user_id>` — reverse a ban-list decision: removes the ID from the shared ban
+  list and unbans them in every server the bot is currently in. Restricted to `REVIEW_ROLE_ID`
+  holders. The original report stays visible in `/banner history` as an audit trail.
+
+The original reporter is DMed (best-effort) when their report is approved or rejected.
+`/banner report` submissions are rate-limited per reporter (`REPORT_RATE_LIMIT_MAX` per
+`REPORT_RATE_LIMIT_WINDOW_HOURS`, default 5 per 24h) to prevent the review queue from being
+spammed.
 
 Notes:
 - The bot needs the “Ban Members” permission.

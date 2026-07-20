@@ -146,6 +146,53 @@ class ReportCmdGuardClauseTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ReportCmdPreDeferFailureTests(unittest.IsolatedAsyncioTestCase):
+    """The rate-limit/ban-list/pending-report checks all run before
+    interaction.response.defer() -- an adversarial review flagged that none of these
+    three DB calls were guarded, so a transient DB hiccup would leave the interaction
+    to time out with no response at all instead of a clean error reply. Each is now
+    independently wrapped; these tests prove it."""
+
+    async def test_rate_limit_check_failure_gives_clean_error_reply(self):
+        interaction = make_interaction()
+        with patch.object(bot, "REVIEW_CHANNEL_ID", REVIEW_CHANNEL_ID), \
+             patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "count_recent_reports_by_reporter", side_effect=RuntimeError("db exploded")), \
+             patch.object(bot, "is_spammer_id") as mock_is_spammer:
+            await bot.report_cmd.callback(interaction, "123456789012345678", make_evidence())  # must not raise
+
+        interaction.response.send_message.assert_awaited_once()
+        self.assertIn("internal error", interaction.response.send_message.call_args.args[0])
+        mock_is_spammer.assert_not_called()
+
+    async def test_ban_list_check_failure_gives_clean_error_reply(self):
+        interaction = make_interaction()
+        with patch.object(bot, "REVIEW_CHANNEL_ID", REVIEW_CHANNEL_ID), \
+             patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "count_recent_reports_by_reporter", return_value=0), \
+             patch.object(bot, "is_spammer_id", side_effect=RuntimeError("db exploded")), \
+             patch.object(bot, "get_pending_report_for_target") as mock_pending:
+            await bot.report_cmd.callback(interaction, "123456789012345678", make_evidence())  # must not raise
+
+        interaction.response.send_message.assert_awaited_once()
+        self.assertIn("internal error", interaction.response.send_message.call_args.args[0])
+        mock_pending.assert_not_called()
+
+    async def test_pending_report_check_failure_gives_clean_error_reply(self):
+        interaction = make_interaction()
+        with patch.object(bot, "REVIEW_CHANNEL_ID", REVIEW_CHANNEL_ID), \
+             patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "count_recent_reports_by_reporter", return_value=0), \
+             patch.object(bot, "is_spammer_id", return_value=False), \
+             patch.object(bot, "get_pending_report_for_target", side_effect=RuntimeError("db exploded")), \
+             patch.object(bot, "create_report") as mock_create:
+            await bot.report_cmd.callback(interaction, "123456789012345678", make_evidence())  # must not raise
+
+        interaction.response.send_message.assert_awaited_once()
+        self.assertIn("internal error", interaction.response.send_message.call_args.args[0])
+        mock_create.assert_not_called()
+
+
 class ReportCmdFullFlowTests(unittest.IsolatedAsyncioTestCase):
     """Deeper flow: create_report -> post to review channel, and the error paths
     added to prevent orphaned 'pending' rows (adversarial review finding #2) and

@@ -19,7 +19,7 @@ Run via (from repo root):
     .venv\\Scripts\\python.exe -m unittest tests.test_unban_command -v
 """
 import unittest
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import Mock, AsyncMock, PropertyMock, patch
 
 import discord
 
@@ -54,6 +54,13 @@ def make_guild(guild_id, unban_side_effect=None):
     else:
         guild.unban = AsyncMock(return_value=None)
     return guild
+
+
+def patch_bot_guilds(guilds_list):
+    """bot.bot.guilds is a read-only discord.Client property; PropertyMock is the
+    standard way to stub it out (same pattern used in tests/test_async_db_offload.py
+    for on_ready)."""
+    return patch.object(type(bot.bot), "guilds", new_callable=PropertyMock, return_value=guilds_list)
 
 
 def _capture_create_task():
@@ -135,7 +142,7 @@ class UnbanCmdValidationTests(unittest.IsolatedAsyncioTestCase):
         interaction = make_interaction(member)
         with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
              patch.object(bot, "is_spammer_id", return_value=False) as mock_is_spammer, \
-             patch.object(bot, "get_enabled_configured_servers") as mock_get_servers, \
+             patch_bot_guilds([]), \
              patch.object(bot, "remove_spammer_id") as mock_remove:
             await bot.unban_cmd.callback(interaction, "123456789012345678")
 
@@ -143,15 +150,39 @@ class UnbanCmdValidationTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.send_message.assert_awaited_once()
         self.assertIn("not currently on the ban list", interaction.response.send_message.call_args.args[0])
         interaction.response.defer.assert_not_awaited()
-        mock_get_servers.assert_not_called()
+        mock_remove.assert_not_called()
+
+    async def test_is_spammer_check_failure_gives_clean_error_reply(self):
+        # Adversarial-review finding: this pre-defer check was previously unguarded.
+        member = make_member(has_role=True)
+        interaction = make_interaction(member)
+        with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
+             patch.object(bot, "is_spammer_id", side_effect=RuntimeError("db exploded")), \
+             patch.object(bot, "remove_spammer_id") as mock_remove:
+            await bot.unban_cmd.callback(interaction, "123456789012345678")  # must not raise
+
+        interaction.response.send_message.assert_awaited_once()
+        self.assertIn("internal error", interaction.response.send_message.call_args.args[0])
+        interaction.response.defer.assert_not_awaited()
         mock_remove.assert_not_called()
 
 
 class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
     """The multi-guild reversal sweep, run via spawn_background_task's underlying
-    asyncio.create_task -- captured and awaited directly under the same patches."""
+    asyncio.create_task -- captured and awaited directly under the same patches.
 
-    async def test_happy_path_unbans_in_every_enrolled_guild(self):
+    Iterates bot.guilds directly (every guild the bot is currently in), not
+    get_enabled_configured_servers() -- an adversarial-review finding was that the
+    latter would silently skip a guild that had enforcement applied while it *was*
+    enabled+configured but was later disabled or lost its info channel, leaving that
+    guild's live Discord ban permanently untouched by /banner unban."""
+
+    async def asyncSetUp(self):
+        self._sleep_patch = patch("asyncio.sleep", new=AsyncMock())
+        self._sleep_patch.start()
+        self.addAsyncCleanup(self._sleep_patch.stop)
+
+    async def test_happy_path_unbans_in_every_guild_the_bot_is_in(self):
         member = make_member(has_role=True)
         interaction = make_interaction(member)
         target_id = 123456789012345678
@@ -159,17 +190,13 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
         guild_a = make_guild(111)
         guild_b = make_guild(222)
 
-        def fake_get_guild(gid):
-            return {111: guild_a, 222: guild_b}.get(gid)
-
         fake_create_task, captured = _capture_create_task()
 
         with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
              patch.object(bot, "is_spammer_id", return_value=True), \
              patch.object(bot, "remove_spammer_id") as mock_remove_spammer, \
              patch.object(bot, "remove_all_enforced_bans_for_target") as mock_remove_enforced, \
-             patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 999), (222, 888)]), \
-             patch.object(bot.bot, "get_guild", side_effect=fake_get_guild), \
+             patch_bot_guilds([guild_a, guild_b]), \
              patch("asyncio.create_task", side_effect=fake_create_task):
             await bot.unban_cmd.callback(interaction, str(target_id))
 
@@ -196,17 +223,13 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
         guild_a = make_guild(111, unban_side_effect=discord.NotFound(Mock(status=404), "Unknown Ban"))
         guild_b = make_guild(222)
 
-        def fake_get_guild(gid):
-            return {111: guild_a, 222: guild_b}.get(gid)
-
         fake_create_task, captured = _capture_create_task()
 
         with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
              patch.object(bot, "is_spammer_id", return_value=True), \
              patch.object(bot, "remove_spammer_id"), \
              patch.object(bot, "remove_all_enforced_bans_for_target"), \
-             patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 999), (222, 888)]), \
-             patch.object(bot.bot, "get_guild", side_effect=fake_get_guild), \
+             patch_bot_guilds([guild_a, guild_b]), \
              patch("asyncio.create_task", side_effect=fake_create_task):
             await bot.unban_cmd.callback(interaction, str(target_id))
             await captured[0]
@@ -225,17 +248,13 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
         guild_a = make_guild(111, unban_side_effect=discord.Forbidden(Mock(status=403), "Missing Permissions"))
         guild_b = make_guild(222)
 
-        def fake_get_guild(gid):
-            return {111: guild_a, 222: guild_b}.get(gid)
-
         fake_create_task, captured = _capture_create_task()
 
         with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
              patch.object(bot, "is_spammer_id", return_value=True), \
              patch.object(bot, "remove_spammer_id"), \
              patch.object(bot, "remove_all_enforced_bans_for_target"), \
-             patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 999), (222, 888)]), \
-             patch.object(bot.bot, "get_guild", side_effect=fake_get_guild), \
+             patch_bot_guilds([guild_a, guild_b]), \
              patch("asyncio.create_task", side_effect=fake_create_task), \
              patch.object(bot.log, "warning") as mock_warning:
             await bot.unban_cmd.callback(interaction, str(target_id))
@@ -256,17 +275,13 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
         guild_a = make_guild(111, unban_side_effect=RuntimeError("boom"))
         guild_b = make_guild(222)
 
-        def fake_get_guild(gid):
-            return {111: guild_a, 222: guild_b}.get(gid)
-
         fake_create_task, captured = _capture_create_task()
 
         with patch.object(bot, "REVIEW_ROLE_ID", REVIEW_ROLE_ID), \
              patch.object(bot, "is_spammer_id", return_value=True), \
              patch.object(bot, "remove_spammer_id"), \
              patch.object(bot, "remove_all_enforced_bans_for_target"), \
-             patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 999), (222, 888)]), \
-             patch.object(bot.bot, "get_guild", side_effect=fake_get_guild), \
+             patch_bot_guilds([guild_a, guild_b]), \
              patch("asyncio.create_task", side_effect=fake_create_task), \
              patch.object(bot.log, "exception") as mock_exception:
             await bot.unban_cmd.callback(interaction, str(target_id))
@@ -279,15 +294,13 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
         summary = interaction.followup.send.call_args.args[0]
         self.assertIn("1 of 2", summary)
 
-    async def test_guild_no_longer_resolvable_is_skipped_without_error(self):
+    async def test_no_guilds_attempted_reports_zero_of_zero(self):
+        # Bot isn't in any guilds at all -- degenerate but must not crash or divide by
+        # zero; there's no longer a "guild resolves to None" case to test since
+        # bot.guilds only ever yields guilds the bot is actually in.
         member = make_member(has_role=True)
         interaction = make_interaction(member)
         target_id = 123456789012345678
-
-        guild_b = make_guild(222)
-
-        def fake_get_guild(gid):
-            return {222: guild_b}.get(gid)  # 111 resolves to None -- bot no longer in it
 
         fake_create_task, captured = _capture_create_task()
 
@@ -295,17 +308,13 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "is_spammer_id", return_value=True), \
              patch.object(bot, "remove_spammer_id"), \
              patch.object(bot, "remove_all_enforced_bans_for_target"), \
-             patch.object(bot, "get_enabled_configured_servers", return_value=[(111, 999), (222, 888)]), \
-             patch.object(bot.bot, "get_guild", side_effect=fake_get_guild), \
+             patch_bot_guilds([]), \
              patch("asyncio.create_task", side_effect=fake_create_task):
             await bot.unban_cmd.callback(interaction, str(target_id))
             await captured[0]
 
-        guild_b.unban.assert_awaited_once()
-
-        # Only 1 guild was actually attempted (111 was skipped entirely, not counted).
         summary = interaction.followup.send.call_args.args[0]
-        self.assertIn("1 of 1", summary)
+        self.assertIn("0 of 0", summary)
 
     async def test_unexpected_failure_before_sweep_still_sends_a_followup(self):
         # remove_spammer_id blowing up must not leave the interaction hanging silently --
@@ -320,14 +329,14 @@ class UnbanCmdSweepTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "is_spammer_id", return_value=True), \
              patch.object(bot, "remove_spammer_id", side_effect=RuntimeError("db down")), \
              patch.object(bot, "remove_all_enforced_bans_for_target"), \
-             patch.object(bot, "get_enabled_configured_servers") as mock_get_servers, \
+             patch_bot_guilds([]) as mock_guilds, \
              patch("asyncio.create_task", side_effect=fake_create_task), \
              patch.object(bot.log, "exception") as mock_exception:
             await bot.unban_cmd.callback(interaction, str(target_id))
             await captured[0]
 
         mock_exception.assert_called_once()
-        mock_get_servers.assert_not_called()
+        mock_guilds.assert_not_called()  # never got past remove_spammer_id to iterate guilds
         interaction.followup.send.assert_awaited_once_with(
             "Unban failed due to an internal error.", ephemeral=True
         )

@@ -82,6 +82,11 @@ MAX_EVIDENCE_SIZE_BYTES = 8 * 1024 * 1024  # 8 MiB
 # history a given target has accumulated. Older rows beyond the cap are just noted as an
 # omitted count rather than shown.
 HISTORY_DISPLAY_LIMIT = 20
+# get_report_history_for_target's own SQL LIMIT -- a much larger ceiling than
+# HISTORY_DISPLAY_LIMIT, just to bound the query itself for a pathologically
+# over-reported target instead of fetching every row ever, unconditionally, only to
+# discard all but HISTORY_DISPLAY_LIMIT of them in Python.
+HISTORY_QUERY_LIMIT = 200
 
 # Optional: sync slash commands to a single guild instead of globally. Guild-scoped syncs
 # propagate near-instantly (global syncs can take up to ~1hr), so set this during development
@@ -504,9 +509,10 @@ def get_report_history_for_target(target_user_id: int) -> List[dict]:
                        created_at, decided_at
                 FROM public.reports
                 WHERE target_user_id = %s
-                ORDER BY created_at DESC;
+                ORDER BY created_at DESC
+                LIMIT %s;
                 """,
-                (target_user_id,),
+                (target_user_id, HISTORY_QUERY_LIMIT),
             )
             return [dict(r) for r in cur.fetchall()]
     finally:
@@ -784,18 +790,30 @@ async def enforce_bans_once_global():
         return
 
     try:
-        spammer_ids = await asyncio.to_thread(get_spammer_ids)
+        spammer_id_count = len(await asyncio.to_thread(get_spammer_ids))
     except Exception:
         log.exception("Failed to load spammer ids; skipping this enforcement cycle.")
         return
-    if not spammer_ids:
+    if not spammer_id_count:
         return
 
     log.info(
-        f"Enforcing {len(spammer_ids)} spammer IDs across {len(targets)} enabled+configured servers."
+        f"Enforcing {spammer_id_count} spammer IDs across {len(targets)} enabled+configured servers."
     )
 
-    # Process each guild sequentially, with a small random jitter between them
+    # Process each guild sequentially, with a small random jitter between them. Deliberately
+    # NOT passing a single spammer_ids snapshot down to every guild here (unlike a plain
+    # per-guild call) -- this loop can run for tens of seconds to minutes across many guilds,
+    # and threading one frozen list through all of them used to let a concurrent /banner
+    # unban (which can shrink public.users and wipe enforced_bans mid-loop) get silently
+    # undone: a guild processed later in the loop would still see the just-unbanned id in its
+    # stale snapshot, re-ban it, and re-record it as enforced -- and since that id is gone
+    # from public.users, no future cycle would ever revisit or fix it. Letting each guild's
+    # enforce_bans_for_guild() call fetch its own fresh spammer_ids (by not passing the
+    # parameter) narrows that window from "the whole multi-guild loop's duration" down to
+    # "a single guild's own fetch-then-ban window" -- not a perfect fix (a full fix would need
+    # a cross-table transaction), but proportionate to how rare and narrow the remaining race
+    # is versus the loop-duration-wide window this replaces.
     for server_id, channel_id in targets:
         guild = bot.get_guild(server_id)
         if not guild:
@@ -806,7 +824,7 @@ async def enforce_bans_once_global():
         await asyncio.sleep(jitter)
 
         try:
-            new_count = await enforce_bans_for_guild(guild, channel_id, spammer_ids)
+            new_count = await enforce_bans_for_guild(guild, channel_id)
             log.info(
                 f"Guild {guild.id}: enforcement complete, {new_count} new user(s) added to ban list."
             )
@@ -1211,22 +1229,51 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
         )
         return
 
-    # Rate-limit per-reporter, checked before any of the heavier DB lookups below so a
-    # reporter who's already over the limit fails fast and cheaply.
-    recent_count = await asyncio.to_thread(
-        count_recent_reports_by_reporter, interaction.user.id, REPORT_RATE_LIMIT_WINDOW_HOURS
-    )
+    # Each of these three checks happens before interaction.response.defer() -- each is
+    # individually wrapped so a transient DB hiccup produces a clean error reply instead
+    # of leaving the interaction to time out with no response at all.
+    try:
+        # Rate-limit per-reporter, checked before the heavier DB lookups below so a
+        # reporter who's already over the limit fails fast and cheaply.
+        recent_count = await asyncio.to_thread(
+            count_recent_reports_by_reporter, interaction.user.id, REPORT_RATE_LIMIT_WINDOW_HOURS
+        )
+    except Exception:
+        log.exception(f"Failed to check report rate limit for reporter {interaction.user.id}")
+        await interaction.response.send_message(
+            "Failed to submit report due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
     if recent_count >= REPORT_RATE_LIMIT_MAX:
         await interaction.response.send_message(
             "You've submitted too many reports recently; please try again later.", ephemeral=True
         )
         return
 
-    if await asyncio.to_thread(is_spammer_id, target_id):
+    try:
+        already_banned = await asyncio.to_thread(is_spammer_id, target_id)
+    except Exception:
+        log.exception(f"Failed to check ban-list membership for target {target_id}")
+        await interaction.response.send_message(
+            "Failed to submit report due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if already_banned:
         await interaction.response.send_message("That user is already on the ban list.", ephemeral=True)
         return
 
-    if await asyncio.to_thread(get_pending_report_for_target, target_id):
+    try:
+        already_pending = await asyncio.to_thread(get_pending_report_for_target, target_id)
+    except Exception:
+        log.exception(f"Failed to check pending report status for target {target_id}")
+        await interaction.response.send_message(
+            "Failed to submit report due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if already_pending:
         await interaction.response.send_message("That user already has a pending report.", ephemeral=True)
         return
 
@@ -1296,10 +1343,20 @@ async def report_cmd(interaction: discord.Interaction, user_id: str, evidence: d
     await interaction.followup.send(f"Report submitted (#{report_id}) and is awaiting review.", ephemeral=True)
 
 
-@banner_group.command(name="history", description="Show the report history filed against a user ID.")
+@banner_group.command(name="history", description="Show the report history filed against a user ID (review team only).")
 @app_commands.describe(user_id="The numeric Discord user ID to look up")
-@admin_only()
 async def history_cmd(interaction: discord.Interaction, user_id: str):
+    # Permission here mirrors the review-role gate on the Approve/Reject buttons,
+    # report-cancel, and unban -- not admin_only(). This command surfaces reporter and
+    # reviewer Discord ids, which everywhere else in this bot is treated as
+    # review-team-scoped data (only ever previously visible inside REVIEW_CHANNEL_ID);
+    # admin_only() would let any single opted-in server's admin enumerate that identity
+    # data for any target, which is a broader exposure than intended.
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if REVIEW_ROLE_ID is None or not member or not member.get_role(REVIEW_ROLE_ID):
+        await interaction.response.send_message("You don't have permission to view report history.", ephemeral=True)
+        return
+
     if not is_valid_snowflake(user_id):
         await interaction.response.send_message(
             "That doesn't look like a valid Discord user ID (numbers only). "
@@ -1405,7 +1462,16 @@ async def unban_cmd(interaction: discord.Interaction, user_id: str):
 
     target_id = int(user_id)
 
-    if not await asyncio.to_thread(is_spammer_id, target_id):
+    try:
+        already_a_spammer = await asyncio.to_thread(is_spammer_id, target_id)
+    except Exception:
+        log.exception(f"Failed to check ban-list membership for {target_id} during unban")
+        await interaction.response.send_message(
+            "Failed to check the ban list due to an internal error. Please try again.", ephemeral=True
+        )
+        return
+
+    if not already_a_spammer:
         await interaction.response.send_message(
             f"`{target_id}` is not currently on the ban list; nothing to do.", ephemeral=True
         )
@@ -1418,16 +1484,17 @@ async def unban_cmd(interaction: discord.Interaction, user_id: str):
             await asyncio.to_thread(remove_spammer_id, target_id)
             await asyncio.to_thread(remove_all_enforced_bans_for_target, target_id)
 
-            targets = await asyncio.to_thread(get_enabled_configured_servers)
-
+            # Iterate every guild the bot is currently in, not just enabled+configured ones.
+            # A guild could have had enforcement applied while it *was* enabled+configured,
+            # then later been disabled or lost its info channel -- get_enabled_configured_servers()
+            # would silently exclude it here, leaving the live Discord ban in that guild
+            # permanently untouched even though the id is gone from public.users everywhere
+            # else. guild.unban() already degrades gracefully (discord.NotFound) for guilds
+            # where the user was never banned, so it's safe to just attempt it everywhere.
             unbanned_count = 0
             attempted_count = 0
 
-            for server_id, _channel_id in targets:
-                guild = bot.get_guild(server_id)
-                if guild is None:
-                    continue
-
+            for guild in list(bot.guilds):
                 attempted_count += 1
                 try:
                     await guild.unban(discord.Object(id=target_id), reason="Removed from commissionSpammer database")
@@ -1436,13 +1503,15 @@ async def unban_cmd(interaction: discord.Interaction, user_id: str):
                     # Not actually banned in this guild -- nothing to do, not an error.
                     pass
                 except discord.Forbidden:
-                    log.warning(f"Forbidden from unbanning {target_id} in guild {server_id}")
+                    log.warning(f"Forbidden from unbanning {target_id} in guild {guild.id}")
                 except Exception:
-                    log.exception(f"Error unbanning {target_id} in guild {server_id}")
+                    log.exception(f"Error unbanning {target_id} in guild {guild.id}")
+
+                await asyncio.sleep(0.5)  # avoid rate limit issues, matching enforce_bans_for_guild's pacing
 
             await interaction.followup.send(
                 f"Removed `{target_id}` from the ban list and unbanned them in "
-                f"{unbanned_count} of {attempted_count} enrolled server{'s' if attempted_count != 1 else ''}.",
+                f"{unbanned_count} of {attempted_count} server{'s' if attempted_count != 1 else ''} the bot is in.",
                 ephemeral=True,
             )
         except Exception:
