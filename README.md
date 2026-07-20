@@ -149,9 +149,13 @@ Notes:
     live ban list (see below); the periodic job trusts it as-is.
 
 ## Testing & CI
-- Unit tests live in `tests/` (`python -m unittest discover -s tests -v`). No live Discord or
-  Postgres connection is needed — `tests/__init__.py` sets dummy `DATABASE_URL`/`DISCORD_TOKEN`
-  before importing `bot.py`, and all DB/Discord calls in the suite are mocked.
+- Unit tests live in `tests/` (`python -m unittest discover -s tests -t . -v`, run from the repo
+  root). No live Discord or Postgres connection is needed — `tests/__init__.py` sets dummy
+  `DATABASE_URL`/`DISCORD_TOKEN` before importing `bot.py`, and all DB/Discord calls in the suite
+  are mocked. The `-t .` (top-level directory) flag matters: without it, Python imports test
+  modules as bare `test_xxx` instead of `tests.test_xxx`, which skips `tests/__init__.py`
+  entirely and falls through to whatever a local `.env` happens to contain instead of the
+  hermetic dummy values.
 - `.github/workflows/ci.yml` runs `python -m py_compile bot.py` and the full test suite on every
   push to `main` and on every pull request.
 
