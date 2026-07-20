@@ -296,6 +296,22 @@ def remove_enforced_ban(server_id: int, discord_id: int):
     finally:
         conn.close()
 
+
+def remove_all_enforced_bans_for_target(discord_id: int):
+    """Bulk/all-guilds counterpart to remove_enforced_ban: wipe every enforced-ban record for
+    discord_id, regardless of server_id. Used by /banner unban so the local cache doesn't keep
+    thinking this id is still enforced anywhere after a global reversal."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.enforced_bans WHERE discord_id = %s;",
+                    (discord_id,),
+                )
+    finally:
+        conn.close()
+
 def get_server_info(server_id: int) -> Optional[dict]:
     conn = get_db_connection()
     try:
@@ -1212,6 +1228,78 @@ async def report_cancel_cmd(interaction: discord.Interaction, report_id: int):
     await interaction.response.send_message(
         f"Report #{report_id} cancelled — that user can be reported again.", ephemeral=True
     )
+
+
+@banner_group.command(name="unban", description="Reverse a global ban list decision (review team only).")
+@app_commands.describe(user_id="The numeric Discord user ID to remove from the ban list")
+async def unban_cmd(interaction: discord.Interaction, user_id: str):
+    # Permission here mirrors the review-role gate on the Approve/Reject buttons and
+    # report-cancel, not admin_only() -- undoing a ban-list decision is global (it affects
+    # every opted-in server), so a single server's admin must not be able to unilaterally
+    # reverse it.
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if REVIEW_ROLE_ID is None or not member or not member.get_role(REVIEW_ROLE_ID):
+        await interaction.response.send_message("You don't have permission to manage reports.", ephemeral=True)
+        return
+
+    if not is_valid_snowflake(user_id):
+        await interaction.response.send_message(
+            "That doesn't look like a valid Discord user ID (numbers only). "
+            "Right-click the user and choose \"Copy User ID\" (Developer Mode must be enabled).",
+            ephemeral=True,
+        )
+        return
+
+    target_id = int(user_id)
+
+    if not await asyncio.to_thread(is_spammer_id, target_id):
+        await interaction.response.send_message(
+            f"`{target_id}` is not currently on the ban list; nothing to do.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async def _run_unban():
+        try:
+            await asyncio.to_thread(remove_spammer_id, target_id)
+            await asyncio.to_thread(remove_all_enforced_bans_for_target, target_id)
+
+            targets = await asyncio.to_thread(get_enabled_configured_servers)
+
+            unbanned_count = 0
+            attempted_count = 0
+
+            for server_id, _channel_id in targets:
+                guild = bot.get_guild(server_id)
+                if guild is None:
+                    continue
+
+                attempted_count += 1
+                try:
+                    await guild.unban(discord.Object(id=target_id), reason="Removed from commissionSpammer database")
+                    unbanned_count += 1
+                except discord.NotFound:
+                    # Not actually banned in this guild -- nothing to do, not an error.
+                    pass
+                except discord.Forbidden:
+                    log.warning(f"Forbidden from unbanning {target_id} in guild {server_id}")
+                except Exception:
+                    log.exception(f"Error unbanning {target_id} in guild {server_id}")
+
+            await interaction.followup.send(
+                f"Removed `{target_id}` from the ban list and unbanned them in "
+                f"{unbanned_count} of {attempted_count} enrolled server{'s' if attempted_count != 1 else ''}.",
+                ephemeral=True,
+            )
+        except Exception:
+            log.exception(f"Error during unban for target {target_id}")
+            try:
+                await interaction.followup.send("Unban failed due to an internal error.", ephemeral=True)
+            except Exception:
+                pass
+
+    spawn_background_task(_run_unban())
 
 
 async def _check_review_config_health():
